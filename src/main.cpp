@@ -1,0 +1,1973 @@
+#include <Arduino.h>
+#include <Arduino_LSM6DS3.h>
+#include <TemperatureZero.h>
+#include <Adafruit_SleepyDog.h>
+#include <Crypto.h>
+#include <ChaChaPoly.h>
+#include <math.h>
+#include "wiring_private.h"
+#include "config.h"
+#include "ModbusWaterMeter.h"
+#include "device.h"
+#include "DEBUG.h"
+#include "Sim7070GDevice.h"
+
+///////////////////////////////////////////////////////////////////////////
+// CREDENTIALS - Change these values from the portal
+///////////////////////////////////////////////////////////////////////////
+const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+const char* USERNAME = "node_d935168a3a77";
+const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
+const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
+
+///////////////////////////////////////////////////////////////////////////
+// MQTT SERVER
+///////////////////////////////////////////////////////////////////////////
+const char mqtt_server[] = "mqtt.myvpn.id.vn";
+const int mqtt_port = 1883;
+
+///////////////////////////////////////////////////////////////////////////
+// GLOBAL OBJECTS
+///////////////////////////////////////////////////////////////////////////
+TemperatureZero tempSAMD;
+
+// Watchdog helpers
+static inline void WDT_INIT() {
+  Watchdog.enable(HW_WDT_TIMEOUT_SEC * 1000);
+}
+static inline void WDT_RESET() {
+  Watchdog.reset();
+}
+///////////////////////////////////////////////////////////////////////////
+// RUNTIME STATE VARIABLES
+///////////////////////////////////////////////////////////////////////////
+char topic_sub[96];
+char topic_pub[96];
+char clientID[64];
+char mqtt_username[64];
+char mqtt_password[64];
+
+static const char* KEY_HEX = CRYPTOKEY;
+static uint8_t CRYPTO_KEY[32];
+
+bool mqttConnected = false;
+unsigned long lastPublish = 0;
+bool prevPwrOn = false;
+unsigned long publishIntervalMs = PUB_FAST_MS;
+unsigned long lastCheck = 0;
+
+byte pump = 0;
+int onPulse = ON_PULSE_MS;
+bool serverOnCommand = false;
+String receivedMessage = "";
+
+int readResponseWait = READ_RESPONSE_WAIT_MS;
+int simWait = SIM_WAIT_MS;
+
+static unsigned long lastUartActivity = 0;
+inline void noteUartActivity() {
+  lastUartActivity = millis();
+}
+inline bool canRunHealthCheck() {
+  return (millis() - lastUartActivity) > HEALTH_QUIET_MS;
+}
+
+volatile uint32_t cntModemRestarts = 0;
+volatile uint32_t cntGprsConnects = 0;
+volatile uint32_t cntMqttConnects = 0;
+
+unsigned long lastRestartMs = 0;
+unsigned long lastTempCheck = 0;
+
+int vibrationCount = 0;
+int EventCountTotal = 0;
+
+static uint8_t atFailStreak = 0;
+static uint8_t gprsFailStreak = 0;
+static uint8_t mqttFailStreak = 0;
+
+static unsigned long lastATokMs = 0;
+static unsigned long lastGPRSokMs = 0;
+static unsigned long lastMQTTokMs = 0;
+
+volatile bool protectOnStart = false;
+unsigned long protectStartMs = 0;
+unsigned long protectLastAnnounce = 0;
+volatile bool lastOffByHexFlag = false;
+bool prevPumpOn = false;
+
+///////////////////////////////////////////////////////////////////////////
+// DEVICE OBJECTS
+///////////////////////////////////////////////////////////////////////////
+// We instantiate a UART in SERCOM0
+Uart RS485(&sercom0, RS485_RX_PIN, RS485_TX_PIN, SERCOM_RX_PAD_1, UART_TX_PAD_0);
+
+// Modbus Water Meter Module
+ModbusWaterMeter waterMeter(&RS485);
+
+// SIM7070G Modem Device
+Sim7070GDevice modem(&sim7070, NODE_ID);
+
+///////////////////////////////////////////////////////////////////////////
+// LEGACY VARIABLES (backward compatibility)
+///////////////////////////////////////////////////////////////////////////
+byte messege[256];
+uint8_t index_request = 2;
+float parameters[64];
+
+struct modbus_transmit {
+  uint8_t address = 0x01;
+  uint8_t function = 0x03;
+
+  uint32_t startByte_H = 0xFF000000;
+  uint32_t startByte_L = 0x00FF0000;
+
+  uint16_t endByte_H = 0x0000FF00;
+  uint16_t endByte_L = 0x000000FF;
+
+} MODBUS_REQ;
+
+
+
+// ----------------- PROTOTYPES -----------------
+void sendAT(const char* command, unsigned long wait = 100);  // Sends command AT to the modem
+bool sendATwaitOK(const char* cmd, char* out, size_t outCap, unsigned long overallMs = 2500);
+void sendCommandGetResponse(const char* command, char* response, size_t maxLen, unsigned long timeout = 1200);
+void readResponse();
+void modemRestart();
+void mqttConnect();
+bool checkMQTTConnection();
+bool publishMessage();
+bool gprsConnect();
+bool gprsIsConnected();
+void handleMQTTMessages();
+void flushSIMBuffer();
+void checkConnections();
+void turnOnPump();
+void turnOffPump();
+void verifySIMConnected();
+void latchRelaySafetySetup();
+int readAverage(uint8_t pin);
+void safeFlushAfterReset();
+void latchRelaySafetyLoop();
+void printCPUTemperature();
+static inline void makeNonce12(uint8_t nonce[12]);
+size_t encryptPayload(const char* plaintext, uint8_t* ciphertext, uint8_t tag[16], const uint8_t nonce12[12]);
+bool decryptPayload(const uint8_t* ciphertext, size_t ctLen, const uint8_t tag[16], const uint8_t nonce12[12], char* outPlain, size_t outPlainCap);
+void processVibrations(int& vibrationCount, int& EventCountTotal);
+bool getNetworkTimeISO8601(char* isoOut, size_t outCap);
+bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap);
+bool getNetworkHHMMSS(char* hms, size_t cap);
+bool modemAlivePing();
+void diagSnapshot(const char* label);
+
+// NEW: ENSURE AT (MODEM ON) BEFORE CFUN/CNACT WHEN CNACT? RETURNS 0 bytes
+static bool ensureATorPowerCycle(uint8_t atAttempts = 3);
+
+// HEX HELPERS
+void hexEncode(const uint8_t* in, size_t inLen, char* out, size_t outCap, bool uppercase = true);
+bool hexDecode(const char* hex, uint8_t* out, size_t outCap, size_t& outLen);
+
+// MINIMAL JSON HELPERS
+bool jsonGetString(const char* json, const char* key, char* out, size_t cap);
+bool jsonGetBool(const char* json, const char* key, bool& out);
+bool jsonGetInt(const char* json, const char* key, long& out);
+
+bool syncTimeUTC_viaCNTP(uint8_t cid = 1, const char* server = "time.google.com", uint32_t waitTotalMs = 12000UL);
+bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs = 12000UL);
+
+
+int getCSQ_RSSI();       // returns 0..31; -1 if unknown
+int csqToDbm(int rssi);  // useful optional: converts CSQ to dBm
+
+// FUNCTION TO READ VOLTAGES
+float readBatteryVolts();
+
+// ========== STATIC INLINE FUNCTION IMPLEMENTATIONS ==========
+static inline bool isPwrPresent() {
+  byte highs = 0;
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+
+  if (highs == 4) {
+    prevPwrOn = true;
+    return true;
+  }
+  if (highs == 0) {
+    prevPwrOn = false;
+    return false;
+  }
+  return prevPwrOn;  // ambiguous zone: keep state
+}
+
+static inline bool isPumpOn() {
+  return digitalRead(CONTACT_PIN) == HIGH;
+}
+
+static inline void armStartProtection(const char* motivo) {
+  protectOnStart = true;
+  protectStartMs = millis();
+  protectLastAnnounce = 0;
+  DEBUG_PRINT(F("[PROTECT] Started: "));
+  DEBUG_PRINTLN(motivo);
+}
+
+static inline void serviceStartProtection() {
+  if (!protectOnStart) return;
+
+  unsigned long elapsed = millis() - protectStartMs;
+
+  if (elapsed >= PROTECT_ON_MS) {
+    protectOnStart = false;
+    DEBUG_PRINTLN(F("[PROTECT] End. Protection time has passed."));
+  } else {
+    if ((millis() - protectLastAnnounce) >= PROTECT_TICK_MS) {
+      protectLastAnnounce = millis();
+      unsigned long remain = (PROTECT_ON_MS - elapsed) / 1000;
+      DEBUG_PRINT(F("[PROTECT] Active. Remain: "));
+      DEBUG_PRINT(remain);
+      DEBUG_PRINTLN(F(" s."));
+    }
+  }
+}
+
+static inline void servicePumpEdgeAndStatus() {
+  bool nowOn = isPumpOn();
+
+  // Detection of flank: ON -> OFF (turned off by contact, without HEX)
+  if (prevPumpOn && !nowOn) {
+    if (!lastOffByHexFlag) {
+      armStartProtection("Turned OFF detected by contact (without HEX)");
+    } else {
+      lastOffByHexFlag = false;
+    }
+  }
+
+  prevPumpOn = nowOn;
+
+  // X (pump): 1 on, 0 off
+  pump = nowOn ? 1 : 0;
+}
+
+static inline void applyBootConfig() {
+  sendAT("ATE0", 400);
+  sendAT("AT+CFUN=1", 600);
+  sendAT("AT+CMEE=2", 300);
+  sendAT("AT+CPIN?", 400);
+  sendAT("AT+CNMP=38", 400);
+  sendAT("AT+CMNB=2", 400);
+  sendAT("AT+CBANDCFG=\"CAT-M\",2", 400);
+  delay(400);
+}
+
+// ========== END STATIC INLINE FUNCTIONS ==========
+
+// Mandatory ISR to manage interruptions of SERCOM0
+void SERCOM0_Handler() {
+  RS485.IrqHandler();
+}
+
+// Parsing of RS485 data
+
+void READING_PARAM(uint32_t PARAM);
+uint16_t RTU_Vcrc(uint8_t RTU_Buff[], uint16_t RTU_Leng);
+
+bool PARSING_PARAM(uint32_t data[1]);
+float get_param(uint32_t regAddr);
+void RS485_loop_new();  // New modbus implementation
+
+void RS485_loop();
+
+// Device array for DeviceManager
+Device* devices[] = {
+    &waterMeter,
+    &modem
+};
+
+// ----------------- SETUP -----------------
+void setup() {
+  // WDT_INIT();
+  delay(200);
+  pinMode(PWR_ON_PIN, OUTPUT);
+  pinMode(PWR_OFF_PIN, OUTPUT);
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  pinMode(CONTACT_PIN, INPUT);
+
+  pinMode(BATT_VOLTS, INPUT);
+
+  pinMode(Input_Supply_V, INPUT);
+
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+  DEBUG_PRINTLN(F("Starting initialization..."));
+  
+  // Register devices with DeviceManager
+  DeviceManager::getInstance().registerDevices(devices, sizeof(devices) / sizeof(devices[0]));
+  DEBUG_PRINTLN(F("[DEVICE] Devices registered"));
+  
+  // Initialize all devices
+  DeviceManager::getInstance().init();
+  DEBUG_PRINTLN(F("[DEVICE] Devices initialized"));
+  
+  // Start all devices
+  DeviceManager::getInstance().start();
+  DEBUG_PRINTLN(F("[DEVICE] Devices started"));
+
+  DEBUG_PRINTLN(F("Initializing SIM7070G..."));
+}
+
+// ----------------- LOOP -----------------
+void loop() {
+
+  // WDT_RESET();
+  
+  // Update all devices via DeviceManager (handles timeout callbacks)
+  DeviceManager::getInstance().update(millis());
+
+
+}
+
+
+// ----------------- HANDLERS -----------------
+void handleMQTTMessages() {
+  static char incoming[600];
+  static byte idx = 0;
+
+  auto secsFromHMS = [](int H, int M, int S) -> int {
+    if (H < 0) H = 0;
+    if (H > 23) H = 23;
+    if (M < 0) M = 0;
+    if (M > 59) M = 59;
+    if (S < 0) S = 0;
+    if (S > 59) S = 59;
+    return H * 3600 + M * 60 + S;
+  };
+
+  auto circDiffSecs = [&](int a, int b) -> int {
+    const int DAY = 86400;
+    int d = abs(a - b);
+    if (d > DAY) d %= DAY;
+    return min(d, DAY - d);
+  };
+
+  while (sim7070.available()) {
+    char c = sim7070.read();
+    noteUartActivity();
+    if (c == '\n' || c == '\r') {
+      incoming[idx] = '\0';
+      if (idx > 0) {
+        if (strncmp(incoming, "+SMSUB", 6) == 0) {
+          char* payload = strchr(incoming, ',');
+          if (payload) payload = strchr(payload + 1, '"');
+          if (payload) {
+            payload++;
+            char* end = strchr(payload, '"');
+            if (end) *end = '\0';
+
+            DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+            DEBUG_PRINTLN(strlen(payload));
+            DEBUG_PRINTLN(payload);
+
+            const char* hexStr = payload;
+            size_t hexLen = strlen(hexStr);
+            if ((hexLen % 2) == 0 && hexLen >= (12 + 16) * 2) {
+              uint8_t buf[480];
+              size_t bytes = 0;
+              if (hexDecode(hexStr, buf, sizeof(buf), bytes) && bytes >= (12 + 16)) {
+                uint8_t* nonce = buf;
+                uint8_t* tag = buf + (bytes - 16);
+                uint8_t* ct = buf + 12;
+                size_t ctLen = bytes - 12 - 16;
+
+                int nH = nonce[4];
+                int nM = nonce[5];
+                int nS = nonce[6];
+                int secMsg = secsFromHMS(nH, nM, nS);
+
+                // === Multiple tries to obtain ISO time ===
+                char isoNow[21] = { 0 };
+                int rH = 0, rM = 0, rS = 0;
+                bool timeOk = false;
+
+                for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+                  DEBUG_PRINT(F("[TIME] Try number "));
+                  DEBUG_PRINT(attempt);
+                  DEBUG_PRINTLN(F(" from 3 to obtain ISO time..."));
+
+                  memset(isoNow, 0, sizeof(isoNow));
+                  if (getNetworkTimeISO8601(isoNow, sizeof(isoNow))) {
+                    DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
+                    DEBUG_PRINTLN(isoNow);
+
+                    if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
+                      DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
+                      DEBUG_PRINTLN(attempt);
+                      timeOk = true;
+                      break;
+                    } else {
+                      DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
+                    }
+                  } else {
+                    DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
+                  }
+
+                  delay(200 * attempt);
+                  WDT_RESET();
+                }
+
+                if (!timeOk) {
+                  DEBUG_PRINTLN(F("[TIME] Unable to obtain hour from network after 3 tries. Command discarded."));
+                  idx = 0;
+                  continue;
+                }
+
+                // === TIME OBTAINED WITH SUCCESS ===
+                const int secNow = secsFromHMS(rH, rM, rS);
+                const int dsec = circDiffSecs(secMsg, secNow);
+
+                DIAG_PRINT(F(" | NET HMS="));
+                DIAG_PRINT(isoNow + 11);
+                DIAG_PRINT(F(" | Δs="));
+                DIAG_PRINTLN(dsec);
+
+                // === DECIPHER → clear JSON ===
+                char plain[420];
+                bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
+                DEBUG_PRINT(F("[DECRYPT] Result: "));
+                DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
+                if (!ok) {
+                  idx = 0;
+                  continue;
+                }
+
+                DEBUG_PRINT(F("[RX] clear JSON: "));
+                DEBUG_PRINTLN(plain);
+
+                // Window of 30 s
+                const int WINDOW_SEC = 30;
+                if (dsec > WINDOW_SEC) {
+                  DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
+                  idx = 0;
+                  if (publishMessage()) lastPublish = millis();
+                  continue;
+                }
+
+                // === PROCESS X FIELD ===
+                long xVal = -1;
+                if (jsonGetInt(plain, "X", xVal)) {
+                  if (xVal == 1) {
+                    if (protectOnStart) {
+                      unsigned long elapsed = millis() - protectStartMs;
+                      DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protectio ("));
+                      DEBUG_PRINT(elapsed / 1000UL);
+                      DEBUG_PRINTLN(F(" s)."));
+                      if (publishMessage()) lastPublish = millis();
+                    } else {
+                      serverOnCommand = true;
+                      turnOnPump();
+                    }
+                  } else if (xVal == 0) {
+                    serverOnCommand = false;
+                    lastOffByHexFlag = true;
+                    turnOffPump();
+                    armStartProtection("Turned off by HEX command");
+                  } else {
+                    DEBUG_PRINT(F("[ACT] Invalid X Value: "));
+                    DEBUG_PRINTLN(xVal);
+                  }
+                } else {
+                  DEBUG_PRINTLN(F("[ACT] JSON without X field."));
+                }
+
+                long newPulse;
+                if (jsonGetInt(plain, "onPulse", newPulse)) {
+                  onPulse = constrain((int)newPulse, 500, 10000);
+                  DEBUG_PRINT(F("[ACT] onPulse updated to "));
+                  DEBUG_PRINTLN(onPulse);
+                }
+
+              } else {
+                DEBUG_PRINTLN(F("[RX] Invalid HEX HEX (deciphering o length)."));
+              }
+            } else {
+              DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
+            }
+          }
+        } else if (DIAG) {
+          DIAG_PRINT("[URC] ");
+          DIAG_PRINTLN(incoming);
+        }
+      }
+      idx = 0;
+    } else if (idx < sizeof(incoming) - 1) {
+      incoming[idx++] = c;
+    }
+  }
+}
+
+
+
+// ----------------- DIAGNOSTIC -----------------
+void diagSnapshot(const char* label) {
+  if (!DIAG) return;
+  DIAG_PRINT(F("[DIAG] "));
+  DIAG_PRINT(label);
+  DIAG_PRINT(F(" | t="));
+  DIAG_PRINT(millis());
+  DIAG_PRINT(F("ms | avail="));
+  DIAG_PRINT(sim7070.available());
+  DIAG_PRINT(F(" | ATstreak="));
+  DIAG_PRINT(atFailStreak);
+  DIAG_PRINT(F(" | GPRSstreak="));
+  DIAG_PRINT(gprsFailStreak);
+  DIAG_PRINT(F(" | MQTTstreak="));
+  DIAG_PRINT(mqttFailStreak);
+  DIAG_PRINT(F(" | since ATok="));
+  DIAG_PRINT(millis() - lastATokMs);
+  DIAG_PRINT(F(" | since GPRSk="));
+  DIAG_PRINT(millis() - lastGPRSokMs);
+  DIAG_PRINT(F(" | since MQTTk="));
+  DIAG_PRINT(millis() - lastMQTTokMs);
+  DIAG_PRINTLN("");
+}
+
+// ----------------- HEALTH/RECONNECTIONS -----------------
+void checkConnections() {
+  if ((long)(millis() - lastCheck) < (long)CHECK_INTERVAL_MS) return;
+
+  if (!canRunHealthCheck()) {
+    if (DIAG) DIAG_PRINTLN(F("[DIAG] checkConnections posponed: recent UART activity"));
+    return;
+  }
+  /*
+  unsigned long t0 = millis();
+  while (millis() - t0 < 40) {
+    while (sim7070.available()) { (void)sim7070.read(); }
+    DEBUG_PRINTLN("The SIM7070G has been emptied");
+    delay(1);
+  }
+*/
+  if (!canRunHealthCheck()) {
+    if (DIAG) DIAG_PRINTLN(F("[DIAG] posponed after soft-drain"));
+    return;
+  }
+
+  lastCheck = millis();
+
+  bool atOk = false;
+  for (byte attempt = 0; attempt < 3; attempt++) {
+    if (modemAlivePing()) {
+      atOk = true;
+      break;
+    }
+    DEBUG_PRINT(F("Without 'AT' response. Short retry... (try number: "));
+    DEBUG_PRINT(attempt + 1);
+    DEBUG_PRINTLN(F(")..."));
+    delay(180);
+    WDT_RESET();
+  }
+
+  if (!atOk) {
+    atFailStreak++;
+    DEBUG_PRINT(F("AT fail streak = "));
+    DEBUG_PRINTLN(atFailStreak);
+
+    if ((millis() - lastATokMs) < RECENT_OK_GRACE_MS && atFailStreak < AT_FAILS_BEFORE_RESTART) {
+      DEBUG_PRINTLN(F("Recent Ok and few failures: DO NOT restart (grace period)."));
+      return;
+    }
+    if (atFailStreak < AT_FAILS_BEFORE_RESTART) {
+      DEBUG_PRINTLN(F("AT failed under threshold. Will try later."));
+      return;
+    }
+    if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+      DEBUG_PRINTLN(F("Restart blocked by debounce. Waiting for next cycle."));
+      return;
+    }
+
+    DEBUG_PRINTLN(F("Modem not responding consistently. Restarting..."));
+    modemRestart();
+    atFailStreak = 0;
+    if (!gprsConnect()) return;
+    mqttConnect();
+    return;
+  } else {
+    atFailStreak = 0;
+    lastATokMs = millis();
+  }
+  if (!gprsIsConnected()) {
+    DEBUG_PRINTLN(F("GPRS not connected. Skipping MQTT check and attempting GPRS reconnection..."));
+    if (gprsConnect()) {
+      mqttConnect();
+    }
+    return;
+  }
+  {
+    bool mqttOk = false;
+
+    if (checkMQTTConnection()) {
+      mqttOk = true;
+    } else {
+      DEBUG_PRINTLN(F("MQTT NOT connected. Trying to reconnect up to 3 times..."));
+      for (byte attempt = 0; attempt < 3; attempt++) {
+        mqttConnect();
+        if (mqttConnected) {
+          mqttOk = true;
+          break;
+        }
+        delay(900);
+        WDT_RESET();
+      }
+    }
+
+    if (mqttOk) {
+      mqttFailStreak = 0;
+      lastMQTTokMs = millis();
+      if (DIAG) diagSnapshot("MQTT OK (we ommit GPRS)");
+      return;
+    }
+
+    DEBUG_PRINTLN(F("MQTT still disconnected after tries. Verifying GPRS..."));
+  }
+
+  {
+    bool gprsOk = false;
+    for (byte attempt = 0; attempt < 3; attempt++) {
+      DEBUG_PRINT(F("Verifying GPRS (try number: "));
+      DEBUG_PRINT(attempt + 1);
+      DEBUG_PRINTLN(F(")..."));
+
+      if (gprsIsConnected()) {
+        gprsOk = true;
+        break;
+      }
+      DEBUG_PRINTLN(F("GPRS disconnected. Trying to reconnect..."));
+      if (gprsConnect()) {
+        gprsOk = true;
+        break;
+      }
+
+      delay(700);
+      WDT_RESET();
+    }
+
+    if (!gprsOk) {
+      gprsFailStreak++;
+      DEBUG_PRINT(F("GPRS fail streak = "));
+      DEBUG_PRINTLN(gprsFailStreak);
+
+      if ((millis() - lastGPRSokMs) < RECENT_OK_GRACE_MS && gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
+        DEBUG_PRINTLN(F("GPRS failed but it was OK recently. Do not restart."));
+        return;
+      }
+      if (gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
+        DEBUG_PRINTLN(F("GPRS failed under threshold. Retry later."));
+        return;
+      }
+      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+        DEBUG_PRINTLN(F("GPRS failed; restart blocked by debounce."));
+        return;
+      }
+
+      DEBUG_PRINTLN(F("GPRS failed consistently. Restarting modem..."));
+      modemRestart();
+      gprsFailStreak = 0;
+      if (!gprsConnect()) return;
+
+      DEBUG_PRINTLN(F("GPRS OK after restart. Retrying MQTT..."));
+      mqttConnect();
+      if (mqttConnected) {
+        mqttFailStreak = 0;
+        lastMQTTokMs = millis();
+      } else {
+        mqttFailStreak++;
+      }
+      return;
+    } else {
+      gprsFailStreak = 0;
+      lastGPRSokMs = millis();
+    }
+  }
+
+  {
+    if (!mqttConnected) {
+      DEBUG_PRINTLN(F("GPRS OK. Retrying MQTT after GPRS..."));
+      for (byte attempt = 0; attempt < 3; attempt++) {
+        mqttConnect();
+        if (mqttConnected) {
+          mqttFailStreak = 0;
+          lastMQTTokMs = millis();
+          return;
+        }
+        delay(700);
+        WDT_RESET();
+      }
+
+      mqttFailStreak++;
+      DEBUG_PRINT(F("MQTT fail streak = "));
+      DEBUG_PRINTLN(mqttFailStreak);
+
+      if ((millis() - lastMQTTokMs) < RECENT_OK_GRACE_MS && mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
+        DEBUG_PRINTLN(F("MQTT failed but it was OK recently. Do not restart."));
+        return;
+      }
+      if (mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
+        DEBUG_PRINTLN(F("MQTT failed under threshold. Retry later."));
+        return;
+      }
+      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+        DEBUG_PRINTLN(F("MQTT failed; restart blocked by debounce."));
+        return;
+      }
+
+      DEBUG_PRINTLN(F("MQTT consistently. Restarting modem..."));
+      modemRestart();
+      mqttFailStreak = 0;
+      if (!gprsConnect()) return;
+      mqttConnect();
+      return;
+    } else {
+      mqttFailStreak = 0;
+      lastMQTTokMs = millis();
+      return;
+    }
+  }
+}
+
+
+// ----------------- MQTT/GPRS -----------------
+bool publishMessage() {
+  if (!mqttConnected) return false;
+
+  int V1 = readAverage(ADC_PIN_1);
+  int V2 = readAverage(ADC_PIN_2);
+  int V3 = readAverage(ADC_PIN_3);
+
+  // CSQ (0..31; if fails, 0)
+  int csq = getCSQ_RSSI();
+  int CSQ = (csq < 0) ? 0 : csq;
+
+  // Battery (V -> %)
+  float Bv_raw = readBatteryVolts();
+  float Bv = roundf(Bv_raw * 100.0f) / 100.0f;
+  const float V_MIN = 3.00f, V_MAX = 4.05f;
+  int B = (int)lroundf(constrain((Bv - V_MIN) * (100.0f / (V_MAX - V_MIN)), 0.0f, 100.0f));
+
+  float cpuC = tempSAMD.readInternalTemperature();
+  float cpuC_final = isnan(cpuC) ? -127.0f : cpuC;
+
+  // States
+  pump = isPumpOn() ? 1 : 0;         // X
+  int P = protectOnStart ? 1 : 0;    // Protection of pump restart
+  int PWR = isPwrPresent() ? 1 : 0;  // Main pwer line present with debounce
+  DEBUG_PRINT("PIN Voltage: ");
+  DEBUG_PRINTLN((digitalRead(Input_Supply_V)));
+
+  // === Publish rate with PWR conditional ===
+  if (PWR == 1) {
+    // With main power line, always publish fast
+    if (publishIntervalMs != PUB_FAST_MS) {
+      publishIntervalMs = PUB_FAST_MS;
+      DEBUG_PRINT(F("[RATE] Forced to fast publication because PWR=1: "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    }
+  } else {
+    // With battery power (PWR=0): apply hysteresis by lever battery
+    if (publishIntervalMs == PUB_FAST_MS && B < BAT_THRESH_PCT) {
+      publishIntervalMs = PUB_SLOW_MS;
+      DEBUG_PRINT(F("[RATE] Slow publish because of low battery and PWR=0: "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    } else if (publishIntervalMs == PUB_SLOW_MS && B >= BAT_THRESH_PCT + BAT_HYST_PCT) {
+      publishIntervalMs = PUB_FAST_MS;
+      DEBUG_PRINT(F("[RATE] Returns to fast publish because battery level is restored (PWR=0): "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    }
+  }
+  // RS485 values already updated by RS485_loop_new() right before publishMessage()
+  float FLOW = waterMeter.getCurrentFlow();      // current flow (m³/h)
+  float TOT = waterMeter.getCumulativeFlow();    // cumulative (m³)
+
+  // AT_UTC
+  char tsZ[21] = { 0 };  // "YYYY-MM-DDTHH:MM:SSZ"
+  bool haveTs = getNetworkTimeISO8601(tsZ, sizeof(tsZ));
+
+  // JSON (without HMS)
+  char plain[420];
+  if (haveTs) {
+    snprintf(plain, sizeof(plain),
+             "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
+             "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
+             "\"TCPU\":%.1f,"
+             "\"FLOW\":%.3f,\"TOT\":%.1f,"
+             "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
+             "\"PWR\":%d,\"AT_UTC\":\"%s\"}",
+             V1, V2, V3,
+             pump, P, B, CSQ,
+             cpuC_final,
+             FLOW, TOT,
+             (unsigned long)cntModemRestarts,
+             (unsigned long)cntGprsConnects,
+             (unsigned long)cntMqttConnects,
+             PWR, tsZ);
+  } else {
+    snprintf(plain, sizeof(plain),
+             "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
+             "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
+             "\"TCPU\":%.1f,"
+             "\"FLOW\":%.3f,\"TOT\":%.1f,"
+             "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
+             "\"PWR\":%d,\"AT_UTC\":null}",
+             V1, V2, V3,
+             pump, P, B, CSQ,
+             cpuC_final,
+             FLOW, TOT,
+             (unsigned long)cntModemRestarts,
+             (unsigned long)cntGprsConnects,
+             (unsigned long)cntMqttConnects,
+             PWR);
+  }
+
+  DEBUG_PRINT(F("[TX] Clear JSON to be published: "));
+  DEBUG_PRINTLN(plain);
+
+  // CIPHER AND PUBLISH
+  uint8_t ct[420], tag[16], nonce[12];
+  makeNonce12(nonce);
+  size_t ctLen = encryptPayload(plain, ct, tag, nonce);
+
+  char hexPayload[(12 + 420 + 16) * 2 + 1];
+  size_t o = 0;
+  hexEncode(nonce, 12, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += 12 * 2;
+  hexEncode(ct, ctLen, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += ctLen * 2;
+  hexEncode(tag, 16, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += 16 * 2;
+  hexPayload[o] = '\0';
+
+  DEBUG_PRINTLN("Published HEX: ");
+  DEBUG_PRINTLN(hexPayload);
+
+  int len = strlen(hexPayload);
+  sim7070.print(F("AT+SMPUB=\""));
+  sim7070.print(topic_pub);
+  sim7070.print(F("\","));
+  sim7070.print(len);
+  sim7070.println(F(",1,0"));
+  noteUartActivity();
+  delay(120);
+  sim7070.print(hexPayload);
+  noteUartActivity();
+  delay(350);
+  noteUartActivity();
+
+  EventCountTotal = 0;
+  return true;
+}
+
+
+bool checkMQTTConnection() {
+  char response[96] = { 0 };
+  sendCommandGetResponse("AT+SMSTATE?", response, sizeof(response), 1500);
+  mqttConnected = strstr(response, "+SMSTATE: 1") != NULL;
+
+  if (mqttConnected) {
+    DEBUG_PRINTLN(F("Connected to MQTT"));
+    lastMQTTokMs = millis();
+  } else {
+    DEBUG_PRINT(F("MQTT NOT connected. State: "));
+    DEBUG_PRINTLN(response);
+  }
+  return mqttConnected;
+}
+
+void mqttConnect() {
+
+  if (!gprsIsConnected()) {
+    DEBUG_PRINTLN(F("mqttConnect: GPRS not connected. Aborting MQTT connection attempt."));
+    mqttConnected = false;
+    return;
+  }
+  if (checkMQTTConnection()) {
+    return;
+  }
+
+  if (!ensureATorPowerCycle(3)) {
+    DEBUG_PRINTLN(F("mqttConnect: there are no AT after retry. Aborting."));
+    mqttConnected = false;
+    return;
+  }
+  if (checkMQTTConnection()) {
+    DEBUG_PRINTLN(F("MQTT already connected after ensuring AT. Ommitting reconnection."));
+    return;
+  }
+
+  DEBUG_PRINTLN(F("Connecting to MQTT"));
+
+  sendAT("AT+SMDISC", 200);
+
+  char cmd[96];
+  sendAT("AT+SMCONF=\"URL\",\"\"", 100);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\"", mqtt_server);
+  sendAT(cmd, 120);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PORT\",\"%d\"", mqtt_port);
+  sendAT(cmd, 120);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", clientID);
+  sendAT(cmd, 120);
+
+  sendAT("AT+SMCONF=\"CLEANSS\",1", 100);
+  sendAT("AT+SMCONF=\"QOS\",\"0\"", 100);
+  sendAT("AT+SMCONF=\"RETAIN\",\"0\"", 100);
+  sendAT("AT+SMCONF=\"KEEPTIME\",60", 100);
+
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", mqtt_username);
+  sendAT(cmd, 120);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", mqtt_password);
+  sendAT(cmd, 120);
+
+  DEBUG_PRINTLN(F("Connecting to broker..."));
+  sendAT("AT+SMCONN", 2500);
+  delay(800);
+
+  if (checkMQTTConnection()) {
+    cntMqttConnects++;
+    snprintf(cmd, sizeof(cmd), "AT+SMSUB=\"%s\",1", topic_sub);
+    sendAT(cmd, 500);
+    DEBUG_PRINT(F("Subscribed to: "));
+    DEBUG_PRINTLN(topic_sub);
+    readResponse();
+    lastMQTTokMs = millis();
+  } else {
+    DEBUG_PRINTLN(F("MQTT connection failed"));
+  }
+}
+
+
+// ====== NEW: Ensure AT before CFUN/CNACT when CNACT? returns 0 bytes ======
+static bool ensureATorPowerCycle(uint8_t atAttempts) {
+  for (uint8_t i = 0; i < atAttempts; i++) {
+    if (modemAlivePing()) {
+      DEBUG_PRINTLN(F("AT OK (without power cycle)."));
+      return true;
+    }
+    DEBUG_PRINT(F("AT does not respond (try number: "));
+    DEBUG_PRINT(i + 1);
+    DEBUG_PRINTLN(F(")."));
+    delay(250);
+    WDT_RESET();
+  }
+
+  DEBUG_PRINTLN(F("Without AT after 3 retries. Cycling with PWRKEY (modemRestart)..."));
+  modemRestart();
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 20000UL) {
+    if (modemAlivePing()) {
+      DEBUG_PRINTLN(F("AT OK after power cycle."));
+      return true;
+    }
+    delay(200);
+    WDT_RESET();
+  }
+
+  DEBUG_PRINTLN(F("AT not available after power cycle."));
+  return false;
+}
+
+bool gprsConnect() {
+  DEBUG_PRINTLN(F("Verifying GPRS state..."));
+
+
+  char response[160] = { 0 };
+
+  // ============================================
+  // 1) READ + PRINT TIME BEFORE ANYTHING ELSE
+  // ============================================
+  {
+    char cclkResp[128] = { 0 };
+    char iso[32] = { 0 };
+
+    DEBUG_PRINTLN(F("[GPRS] Getting CCLK before PDP..."));
+    sendCommandGetResponse("AT+CCLK?", cclkResp, sizeof(cclkResp), 2000);
+
+    DEBUG_PRINT(F("[GPRS] Raw CCLK response: "));
+    DEBUG_PRINTLN(cclkResp);
+
+    if (parseCCLKToISO(cclkResp, iso, sizeof(iso))) {
+      DEBUG_PRINT(F("[GPRS] Parsed UTC time: "));
+      DEBUG_PRINTLN(iso);  // Example: 2025-12-16T22:15:30Z
+    } else {
+      DEBUG_PRINTLN(F("[GPRS] Could not parse CCLK into ISO-8601."));
+    }
+  }
+
+  sendCommandGetResponse("AT+CNACT?", response, sizeof(response), 2000);
+
+  if (response[0] == '\0') {
+    DEBUG_PRINTLN(F("CNACT? returned 0 bytes. Ensuring AT (modem on) before touching CFUN/CNACT..."));
+    if (!ensureATorPowerCycle(3)) {
+      DEBUG_PRINTLN(F("Aborting GPRS: there is no AT."));
+      return false;
+    }
+    memset(response, 0, sizeof(response));
+    sendCommandGetResponse("AT+CNACT?", response, sizeof(response), 2000);
+  }
+
+  if (strstr(response, "+CNACT: 1,1")) {
+    DEBUG_PRINTLN(F("Connecting to data context (CID=1)."));
+    lastGPRSokMs = millis();
+    cntGprsConnects++;
+
+
+    // --- Synchronize UTC time via multiple NTP servers ---
+    syncTimeUTC_any(PDP_CID, 12000UL);
+
+    return true;
+  }
+
+  {
+    char fun[64] = { 0 };
+    sendCommandGetResponse("AT+CFUN?", fun, sizeof(fun), 1500);
+
+    if (fun[0] == '\0') {
+      DEBUG_PRINTLN(F("CFUN? returned 0 bytes. Ensuring AT before CFUN..."));
+      if (!ensureATorPowerCycle(3)) {
+        DEBUG_PRINTLN(F("Aborting GPRS: there is no AT."));
+        return false;
+      }
+      memset(fun, 0, sizeof(fun));
+      sendCommandGetResponse("AT+CFUN?", fun, sizeof(fun), 1500);
+    }
+
+    if (!strstr(fun, "+CFUN: 1")) {
+      DEBUG_PRINT(F("Current CFUN: "));
+      DEBUG_PRINTLN(fun);
+      sendAT("AT+CFUN=1", 2500);
+      delay(1500);
+      WDT_RESET();
+    }
+  }
+
+  sendAT("AT+CPSMS=0", 200);
+  sendAT("AT+CGDCONT=1,\"IP\",\"" PDP_APN "\"", simWait);
+  sendAT("AT+CNMP=2", simWait);    // auto
+  sendAT("AT+CSOCKSETPN=1", 200);  // reinforcement
+
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
+    DEBUG_PRINT(F("Activating data context (try number: "));
+    DEBUG_PRINT(attempt + 1);
+    DEBUG_PRINTLN(F(")..."));
+
+    if (!modemAlivePing()) {
+      DEBUG_PRINTLN(F("AT failed before CNACT. Ensuring AT..."));
+      if (!ensureATorPowerCycle(3)) {
+        DEBUG_PRINTLN(F("Aborting GPRS: there is no AT."));
+        return false;
+      }
+    }
+
+    sendAT("AT+CNACT=1,0", 800);
+    sendAT("AT+CNACT=1,1", 2000);
+
+    memset(response, 0, sizeof(response));
+    sendCommandGetResponse("AT+CNACT?", response, sizeof(response), 2500);
+
+    if (response[0] == '\0') {
+      DEBUG_PRINTLN(F("CNACT? returned 0 bytes after activation. Ensuring AT and rereading state..."));
+      if (!ensureATorPowerCycle(3)) {
+        DEBUG_PRINTLN(F("Aborting GPRS: there is no AT."));
+        return false;
+      }
+      memset(response, 0, sizeof(response));
+      sendCommandGetResponse("AT+CNACT?", response, sizeof(response), 2500);
+    }
+
+    DEBUG_PRINT(F("Response CNACT (post intent): "));
+    DEBUG_PRINTLN(response);
+    if (strstr(response, "+CNACT: 1,1")) {
+      DEBUG_PRINTLN(F("Connected to data context (CID=1)."));
+      lastGPRSokMs = millis();
+      cntGprsConnects++;
+
+      // --- Synchronize UTC time via multiple NTP servers ---
+      syncTimeUTC_any(PDP_CID, 12000UL);
+
+      return true;
+    }
+
+    WDT_RESET();
+    delay(1000);
+  }
+
+  DEBUG_PRINTLN(F("Error: Unable to connect to data context (wihtout recursion)."));
+  return false;
+}
+
+bool gprsIsConnected() {
+  char response[120];
+  sendCommandGetResponse("AT+CNACT?", response, sizeof(response), 1500);
+  bool ok = strstr(response, "+CNACT: 1,1") != NULL;
+  if (ok) lastGPRSokMs = millis();
+  return ok;
+}
+
+// ----------------- AT HELPERS -----------------
+void sendAT(const char* command, unsigned long wait) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 20) {
+    while (sim7070.available()) {
+      (void)sim7070.read();
+      noteUartActivity();
+    }
+    delay(1);
+  }
+
+  sim7070.println(command);
+  noteUartActivity();
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] sendAT \""));
+    DIAG_PRINT(command);
+    DIAG_PRINT(F("\" wait="));
+    DIAG_PRINTLN(wait);
+  }
+  delay(wait);
+  readResponse();
+}
+
+bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) {
+  char buf[128] = {0};
+  char cmd[96];
+  char timeBefore[160] = {0};
+  char timeAfter[160] = {0};
+
+  DEBUG_PRINT(F("[NTP] Synchronizing with server: "));
+  DEBUG_PRINTLN(server);
+
+  // Capture time BEFORE sync attempt
+  sendCommandGetResponse("AT+CCLK?", timeBefore, sizeof(timeBefore), 1200);
+
+  // Configure NTP server
+  snprintf(cmd, sizeof(cmd), "AT+CNTPCID=%u", cid);
+  sendCommandGetResponse(cmd, buf, sizeof(buf), 1200);
+
+  snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",0", server);
+  sendCommandGetResponse(cmd, buf, sizeof(buf), 1500);
+
+  // Trigger NTP sync
+  sendCommandGetResponse("AT+CNTP", buf, sizeof(buf), 1500);
+
+  // Poll for result
+  bool ok = false;
+  bool explicitFailure = false;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < waitTotalMs) {
+    memset(buf, 0, sizeof(buf));
+    sendCommandGetResponse("AT+CNTP?", buf, sizeof(buf), 900);
+
+    // Check for success
+    if (strstr(buf, "+CNTP: 1")) {
+      ok = true;
+      DEBUG_PRINTLN(F("[NTP] Sync successful!"));
+      break;
+    }
+
+    // Check for explicit failure
+    if (strstr(buf, "+CNTP: 0")) {
+      explicitFailure = true;
+      DEBUG_PRINTLN(F("[NTP] Explicit failure (+CNTP: 0)"));
+      break;
+    }
+
+    if (strstr(buf, "ERROR") || strstr(buf, "+CME ERROR")) {
+      explicitFailure = true;
+      DEBUG_PRINTLN(F("[NTP] Error response"));
+      break;
+    }
+
+    delay(600);
+    WDT_RESET();
+  }
+
+  if (!ok && !explicitFailure) {
+    DEBUG_PRINTLN(F("[NTP] Timeout waiting for response"));
+  }
+
+  // Capture time AFTER sync attempt
+  sendCommandGetResponse("AT+CCLK?", timeAfter, sizeof(timeAfter), 1200);
+
+  // Verify time actually changed (additional validation)
+  if (ok && strcmp(timeBefore, timeAfter) == 0) {
+    DEBUG_PRINTLN(F("[NTP] Warning: Time didn't change after NTP sync"));
+    // You might want to treat this as a failure:
+    // ok = false;
+  }
+
+  DEBUG_PRINT(F("[NTP] Time before: "));
+  DEBUG_PRINTLN(timeBefore);
+  DEBUG_PRINT(F("[NTP] Time after:  "));
+  DEBUG_PRINTLN(timeAfter);
+
+  if (ok) {
+    DEBUG_PRINTLN(F("[NTP] Time synchronized successfully"));
+  } else {
+    DEBUG_PRINT(F("[NTP] Failed to synchronize with "));
+    DEBUG_PRINTLN(server);
+  }
+
+  return ok;
+}
+
+// Try several NTP servers in order until one works
+bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs) {
+  // Order them by preference
+  const char* servers[] = {
+    "time.google.com",
+    "time.cloudflare.com",
+    "pool.ntp.org",
+    "time.windows.com",
+    "time.nist.gov"
+  };
+  const size_t nServers = sizeof(servers) / sizeof(servers[0]);
+
+  for (size_t i = 0; i < nServers; i++) {
+    DEBUG_PRINT(F("[NTP] Trying server: "));
+    DEBUG_PRINTLN(servers[i]);
+
+    if (syncTimeUTC_viaCNTP(cid, servers[i], waitTotalMs)) {
+      DEBUG_PRINT(F("[NTP] Time synchronized using: "));
+      DEBUG_PRINTLN(servers[i]);
+      return true;
+    }
+  }
+
+  DEBUG_PRINTLN(F("[NTP] All NTP servers failed. Keeping previous clock / network time."));
+  return false;
+}
+
+
+bool sendATwaitOK(const char* cmd, char* out, size_t outCap, unsigned long overallMs) {
+  if (outCap == 0) return false;
+  out[0] = '\0';
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 20) {
+    while (sim7070.available()) {
+      (void)sim7070.read();
+      noteUartActivity();
+    }
+    delay(1);
+  }
+
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] sendATwaitOK avail-before="));
+    DIAG_PRINTLN(sim7070.available());
+  }
+
+  sim7070.println(cmd);
+  noteUartActivity();
+
+  unsigned long tstart = millis();
+  size_t w = 0;
+  bool sawOK = false, sawERROR = false;
+
+  while (millis() - tstart < overallMs) {
+    while (sim7070.available()) {
+      char c = sim7070.read();
+      noteUartActivity();
+      if (w < outCap - 1) out[w++] = c;
+
+      if (c == '\n') {
+        out[w] = '\0';
+        if (strstr(out, "\nOK") || strstr(out, "OK\r") || strstr(out, "OK\n")) {
+          sawOK = true;
+          goto done;
+        }
+        if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) {
+          sawERROR = true;
+          goto done;
+        }
+      }
+    }
+    WDT_RESET();
+  }
+
+  out[w] = '\0';
+  if (strstr(out, "OK")) sawOK = true;
+  if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) sawERROR = true;
+
+done:
+  out[w] = '\0';
+  if (sawOK && !sawERROR) lastATokMs = millis();
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] sendATwaitOK result="));
+    DIAG_PRINT(sawOK && !sawERROR ? "OK" : "FAIL");
+    DIAG_PRINT(F(" bytes="));
+    DIAG_PRINTLN(w);
+  }
+  return sawOK && !sawERROR;
+}
+
+void flushSIMBuffer() {
+  while (sim7070.available()) (void)sim7070.read();
+}
+
+void sendCommandGetResponse(const char* command, char* buffer, size_t bufferSize, unsigned long timeout) {
+  if (bufferSize == 0) return;
+  buffer[0] = '\0';
+  /*
+  unsigned long t0 = millis();
+  while (millis() - t0 < 20) {
+    while (sim7070.available()) {
+      (void)sim7070.read();
+      noteUartActivity();
+    }
+    delay(1);
+  }
+*/
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] sendCmd avail-before="));
+    DIAG_PRINT(sim7070.available());
+    DIAG_PRINT(F(" cmd="));
+    DIAG_PRINTLN(command);
+  }
+
+  sim7070.println(command);
+  noteUartActivity();
+
+  unsigned long start = millis();
+  size_t idx = 0;
+  bool sawTerminator = false;
+
+  while (millis() - start < timeout && idx < bufferSize - 1) {
+    while (sim7070.available() && idx < bufferSize - 1) {
+      char c = sim7070.read();
+      noteUartActivity();
+      buffer[idx++] = c;
+
+      if (c == '\n') {
+        buffer[idx] = '\0';
+        if (strstr(buffer, "\nOK") || strstr(buffer, "OK\r") || strstr(buffer, "OK\n") || strstr(buffer, "ERROR") || strstr(buffer, "+CME ERROR")) {
+          sawTerminator = true;
+          goto endread;
+        }
+      }
+    }
+    WDT_RESET();
+  }
+
+endread:
+  buffer[idx] = '\0';
+  if (strstr(buffer, "OK")) lastATokMs = millis();
+
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] sendCmd done bytes="));
+    DIAG_PRINT(idx);
+    DIAG_PRINT(F(" sawTerm="));
+    DIAG_PRINTLN(sawTerminator ? "Y" : "N");
+  }
+}
+
+void safeFlushAfterReset() {
+  unsigned long t0 = millis();
+  while (millis() - t0 < 200) {
+    while (sim7070.available()) {
+      (void)sim7070.read();
+      noteUartActivity();
+    }
+    delay(5);
+  }
+}
+
+void readResponse() {
+  receivedMessage = "";
+  unsigned long timeout = millis() + readResponseWait;
+  while (millis() < timeout) {
+    while (sim7070.available()) {
+      char c = sim7070.read();
+      noteUartActivity();
+      receivedMessage += c;
+      if (receivedMessage.length() > 550) break;
+    }
+    WDT_RESET();
+  }
+  if (receivedMessage.length() > 0) {
+    DEBUG_PRINTLN(receivedMessage);
+    receivedMessage = "";
+  }
+}
+
+
+int getCSQ_RSSI() {
+  char buf[128] = { 0 };
+
+  // Use the helper that reads the reponse and detects "OK"
+  if (!sendATwaitOK("AT+CSQ", buf, sizeof(buf), 1500)) {
+    return -1;  // there was no OK
+  }
+
+  // Looks for the line +CSQ: <rssi>,<ber>
+  const char* p = strstr(buf, "+CSQ:");
+  if (!p) return -1;
+
+  int rssi = 99, ber = 0;
+  if (sscanf(p, "+CSQ: %d,%d", &rssi, &ber) != 2) return -1;
+
+  if (rssi == 99) return -1;  // 99 = unknown
+  if (rssi < 0) rssi = 0;
+  if (rssi > 31) rssi = 31;
+  return rssi;  // 0..31
+}
+
+
+
+// ----------------- EQUIPMENT CONTROL -----------------
+void turnOffPump() {
+  if (!isPumpOn()) {
+    DEBUG_PRINTLN(F("Pump is already off."));
+    if (publishMessage()) lastPublish = millis();
+    return;
+  }
+  DEBUG_PRINTLN(F("Turn off equipment (pump)"));
+  digitalWrite(PWR_OFF_PIN, HIGH);
+  delay(1000);
+  digitalWrite(PWR_OFF_PIN, LOW);
+  delay(10);
+  if (publishMessage()) lastPublish = millis();
+}
+
+void turnOnPump() {
+  if (protectOnStart) {
+    unsigned long elapsed = millis() - protectStartMs;
+    DEBUG_PRINT(F("Turn ON request ignored: currently in protection. ("));
+    DEBUG_PRINT(elapsed / 1000UL);
+    DEBUG_PRINTLN(F(" s)."));
+    return;
+  }
+
+  WDT_RESET();
+  if (isPumpOn()) {
+    DEBUG_PRINTLN(F("Pump is already off."));
+    return;
+  }
+  DEBUG_PRINTLN(F("Turn on equipment (pump)"));
+  digitalWrite(PWR_ON_PIN, HIGH);
+  delay(onPulse);
+  WDT_RESET();
+  delay(onPulse);
+  digitalWrite(PWR_ON_PIN, LOW);
+  delay(10);
+  if (publishMessage()) lastPublish = millis();
+}
+
+// ----------------- MODEM POWER -----------------
+void verifySIMConnected() {
+  if (modemAlivePing()) {
+    DEBUG_PRINTLN(F("SIM7070G responds."));
+    return;
+  }
+  DEBUG_PRINTLN(F("There is no 'OK'. Restarting modem..."));
+  modemRestart();
+}
+
+void modemRestart() {
+
+  DEBUG_PRINTLN(F("Elegant restart of modem (PWRKEY and verification)…"));
+  diagSnapshot("pre-restart");
+
+  pinMode(MODEM_PWR_PIN, OUTPUT);
+  digitalWrite(MODEM_PWR_PIN, LOW);
+
+  auto pwrkeyPulse = [&]() {
+    digitalWrite(MODEM_PWR_PIN, HIGH);
+    delay(PWRKEY_MS);
+    digitalWrite(MODEM_PWR_PIN, LOW);
+  };
+
+  auto softDrain = [&]() {
+    unsigned long t0 = millis();
+    while (millis() - t0 < PRE_DRAIN_MS) {
+      while (sim7070.available()) (void)sim7070.read();
+      delay(1);
+      WDT_RESET();
+    }
+  };
+
+  softDrain();
+  if (modemAlivePing()) {
+    DEBUG_PRINTLN(F("Modem already responds. No power cycle required."));
+    diagSnapshot("no-restart-needed");
+    return;
+  }
+
+  DEBUG_PRINTLN(F("Without response. Sending the first PWRKEY pulse (toggle)…"));
+  pwrkeyPulse();
+
+  {
+    unsigned long t0 = millis();
+    while (millis() - t0 < OFF_WAIT_MS) {
+      WDT_RESET();
+      delay(10);
+    }
+  }
+  softDrain();
+
+  if (modemAlivePing()) {
+    DEBUG_PRINTLN(F("Modem responds after first toggle."));
+    {
+      unsigned long t0 = millis();
+      while (millis() - t0 < BOOT_WAIT_MS) {
+        WDT_RESET();
+        delay(10);
+      }
+    }
+    safeFlushAfterReset();
+    lastRestartMs = millis();
+    diagSnapshot("post-restart");
+    applyBootConfig();
+    cntModemRestarts++;
+    return;
+  }
+
+  DEBUG_PRINTLN(F("Still without response. Sending second PWRKEY pulse. (forcing ON)…"));
+  pwrkeyPulse();
+
+  {
+    unsigned long t0 = millis();
+    while (millis() - t0 < BOOT_WAIT_MS) {
+      WDT_RESET();
+      delay(10);
+    }
+  }
+  softDrain();
+  safeFlushAfterReset();
+
+  lastRestartMs = millis();
+  DEBUG_PRINTLN(F("Restart sequence completed. (doble toggle PWRKEY)."));
+  diagSnapshot("post-restart");
+  applyBootConfig();
+  cntModemRestarts++;
+}
+
+
+
+// === Ping AT suave con drenaje y doble ventana ===
+bool modemAlivePing() {
+  unsigned long t0 = millis();
+  int drained = 0;
+  while (millis() - t0 < 30) {
+    while (sim7070.available()) {
+      (void)sim7070.read();
+      DEBUG_PRINTLN("The SIM7070G was emptied SIM7070G Modem Alive Ping");
+      noteUartActivity();
+      drained++;
+    }
+    delay(2);
+  }
+
+  sim7070.write('\r');
+  noteUartActivity();
+  delay(40);
+
+  auto tryAT = [&](uint32_t waitMs) -> bool {
+    char buf[192] = { 0 };
+    size_t idx = 0;
+    sim7070.println("AT");
+    noteUartActivity();
+    unsigned long start = millis();
+    while (millis() - start < waitMs) {
+      while (sim7070.available()) {
+        char c = sim7070.read();
+        noteUartActivity();
+        if (idx < sizeof(buf) - 1) buf[idx++] = c;
+        if (c == '\n') {
+          buf[idx] = '\0';
+          if (strstr(buf, "\nOK") || strstr(buf, "OK\r") || strstr(buf, "OK\n") || strstr(buf, "OK")) {
+            lastATokMs = millis();
+            return true;
+          }
+        }
+      }
+      WDT_RESET();
+      delay(1);
+    }
+    buf[idx] = '\0';
+    if (strstr(buf, "OK")) {
+      lastATokMs = millis();
+      return true;
+    }
+    return false;
+  };
+
+  if (tryAT(400)) return true;
+  if (tryAT(1200)) return true;
+  return false;
+}
+
+
+// ----------------- USEFUL -----------------
+int readAverage(uint8_t pin) {
+  long sum = 0;
+  for (byte i = 0; i < 3; i++) {
+    sum += analogRead(pin);
+    delay(10);
+  }
+  return (sum / 3) * 0.1299;  // 0.08059 para Arduino Uno, 0.1299 para Nano33IoT
+}
+
+void latchRelaySafetySetup() {
+  if (!isPumpOn()) {
+    DEBUG_PRINTLN(F("Initial state: pump OFF. Reset Latch."));
+    digitalWrite(PWR_OFF_PIN, HIGH);
+    delay(1000);
+    digitalWrite(PWR_OFF_PIN, LOW);
+    delay(20);
+  } else {
+    DEBUG_PRINTLN(F("Initial state: pump OFF."));
+  }
+}
+
+void latchRelaySafetyLoop() {
+  if (!isPumpOn() && serverOnCommand == true) {
+    DEBUG_PRINTLN("Turning pump OFF for safety (inside loop).");
+    digitalWrite(PWR_OFF_PIN, HIGH);
+    delay(1000);
+    digitalWrite(PWR_OFF_PIN, LOW);
+    delay(20);
+    serverOnCommand = false;
+    if (publishMessage()) lastPublish = millis();
+  }
+}
+
+void printCPUTemperature() {
+  if ((long)millis() - (long)lastTempCheck <= (long)TEMP_CHECK_INTERVAL_MS) return;
+  lastTempCheck = millis();
+
+  float cpuC = tempSAMD.readInternalTemperature();
+  DEBUG_PRINT("CPU Temp: ");
+  if (isnan(cpuC)) {
+    DEBUG_PRINTLN("N/A");
+  } else {
+    DEBUG_PRINT(cpuC);
+    DEBUG_PRINTLN(" °C");
+  }
+}
+
+// ----------------- NEW makeNonce12 -----------------
+static inline void makeNonce12(uint8_t nonce[12]) {
+  static uint64_t perSecondCtr = 0;  // 40-bit used
+  static uint16_t lastY = 0;
+  static uint8_t lastM = 0;
+  static uint8_t lastD = 0;
+  static uint8_t lastH = 0;
+  static uint8_t lastMin = 0;
+  static uint8_t lastS = 0;
+
+  int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0, S = 0;
+  char iso[32] = { 0 };
+
+  bool haveNetwork = false;
+  if (getNetworkTimeISO8601(iso, sizeof(iso))) {
+    if (sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
+      haveNetwork = true;
+    }
+  }
+
+  if (!haveNetwork) {
+    uint32_t t = millis() / 1000UL;
+    H = (t / 3600UL) % 24;
+    Mi = (t / 60UL) % 60;
+    S = (t) % 60;
+    Y = 0xFFFF;
+    Mo = 0;
+    D = 0;
+  }
+
+  if ((uint16_t)Y != lastY || (uint8_t)Mo != lastM || (uint8_t)D != lastD || (uint8_t)H != lastH || (uint8_t)Mi != lastMin || (uint8_t)S != lastS) {
+    perSecondCtr = 0;
+    lastY = (uint16_t)Y;
+    lastM = (uint8_t)Mo;
+    lastD = (uint8_t)D;
+    lastH = (uint8_t)H;
+    lastMin = (uint8_t)Mi;
+    lastS = (uint8_t)S;
+  }
+
+  nonce[0] = (uint8_t)((((uint16_t)Y) >> 8) & 0xFF);
+  nonce[1] = (uint8_t)(((uint16_t)Y) & 0xFF);
+  nonce[2] = (uint8_t)Mo;
+  nonce[3] = (uint8_t)D;
+  nonce[4] = (uint8_t)H;
+  nonce[5] = (uint8_t)Mi;
+  nonce[6] = (uint8_t)S;
+
+  uint64_t c = perSecondCtr++;
+  c &= 0x000000FFFFFFFFFFULL;
+  nonce[7] = (uint8_t)((c >> 32) & 0xFF);
+  nonce[8] = (uint8_t)((c >> 24) & 0xFF);
+  nonce[9] = (uint8_t)((c >> 16) & 0xFF);
+  nonce[10] = (uint8_t)((c >> 8) & 0xFF);
+  nonce[11] = (uint8_t)(c & 0xFF);
+
+  if (DIAG) {
+    DIAG_PRINT(F("[DIAG] nonce(Y-M-D H:M:S ctr): "));
+    DIAG_PRINT(lastY);
+    DIAG_PRINT('-');
+    DIAG_PRINT(lastM);
+    DIAG_PRINT('-');
+    DIAG_PRINT(lastD);
+    DIAG_PRINT(' ');
+    DIAG_PRINT(lastH);
+    DIAG_PRINT(':');
+    DIAG_PRINT(lastMin);
+    DIAG_PRINT(':');
+    DIAG_PRINT(lastS);
+    DIAG_PRINT(F(" ctr="));
+    DIAG_PRINT(perSecondCtr - 1);
+    DIAG_PRINTLN("");
+  }
+}
+
+size_t encryptPayload(const char* plaintext, uint8_t* ciphertext, uint8_t tag[16], const uint8_t nonce12[12]) {
+  size_t len = strlen(plaintext);
+  ChaChaPoly aead;
+  aead.setKey(CRYPTO_KEY, sizeof(CRYPTO_KEY));
+  aead.setIV(nonce12, 12);
+  aead.encrypt(ciphertext, (const uint8_t*)plaintext, len);
+  aead.computeTag(tag, 16);
+  return len;
+}
+
+bool decryptPayload(const uint8_t* ciphertext, size_t ctLen, const uint8_t tag[16],
+                    const uint8_t nonce12[12], char* outPlain, size_t outPlainCap) {
+  if (outPlainCap < ctLen + 1) return false;
+  ChaChaPoly aead;
+  aead.setKey(CRYPTO_KEY, sizeof(CRYPTO_KEY));
+  aead.setIV(nonce12, 12);
+  aead.decrypt((uint8_t*)outPlain, ciphertext, ctLen);
+  bool ok = aead.checkTag(tag, 16);
+  if (ok) outPlain[ctLen] = '\0';
+  return ok;
+}
+
+// ============== Network Time: ISO ==============
+bool getNetworkTimeISO8601(char* isoOut, size_t outCap) {
+  char resp[96] = { 0 };
+  sendCommandGetResponse("AT+CCLK?", resp, sizeof(resp), 1500);
+  if (strstr(resp, "+CCLK:") == NULL) return false;
+  return parseCCLKToISO(resp, isoOut, outCap);
+}
+
+bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap) {
+  if (!cclkResp || !isoOut || outCap < 21) return false;  // "YYYY-MM-DDTHH:MM:SSZ"+NUL
+
+  const char* p = strchr(cclkResp, '\"');
+  if (!p) return false;
+  const char* q = strchr(p + 1, '\"');
+  if (!q) return false;
+
+  char core[32];
+  size_t n = (size_t)(q - (p + 1));
+  if (n >= sizeof(core)) n = sizeof(core) - 1;
+  memcpy(core, p + 1, n);
+  core[n] = '\0';
+
+  int yy = 0, MM = 0, dd = 0, hh = 0, mi = 0, ss = 0;
+  char tzStr[6] = { 0 };
+  int scanned = sscanf(core, "%2d/%2d/%2d,%2d:%2d:%2d%5s", &yy, &MM, &dd, &hh, &mi, &ss, tzStr);
+  if (scanned < 7) return false;
+
+  int y = (yy <= 69) ? (2000 + yy) : (1900 + yy);
+
+  int tzQuarter = atoi(tzStr);
+  long totalMin = (long)hh * 60L + (long)mi - (long)tzQuarter * 15L;
+
+  int dayShift = 0;
+  if (totalMin < 0) {
+    totalMin += 1440;
+    dayShift = -1;
+  } else if (totalMin >= 1440) {
+    totalMin -= 1440;
+    dayShift = 1;
+  }
+
+  int uh = (int)(totalMin / 60L);
+  int um = (int)(totalMin % 60L);
+  int us = ss;
+
+  auto isLeap = [](int Y) -> bool {
+    return ((Y % 4 == 0) && (Y % 100 != 0)) || (Y % 400 == 0);
+  };
+  auto dim = [&](int Y, int M) -> int {
+    switch (M) {
+      case 1: return 31;
+      case 2: return isLeap(Y) ? 29 : 28;
+      case 3: return 31;
+      case 4: return 30;
+      case 5: return 31;
+      case 6: return 30;
+      case 7: return 31;
+      case 8: return 31;
+      case 9: return 30;
+      case 10: return 31;
+      case 11: return 30;
+      case 12: return 31;
+      default: return 30;
+    }
+  };
+
+  if (dayShift == -1) {
+    dd -= 1;
+    if (dd <= 0) {
+      MM -= 1;
+      if (MM <= 0) {
+        MM = 12;
+        y -= 1;
+      }
+      dd = dim(y, MM);
+    }
+  } else if (dayShift == 1) {
+    dd += 1;
+    if (dd > dim(y, MM)) {
+      dd = 1;
+      MM += 1;
+      if (MM > 12) {
+        MM = 1;
+        y += 1;
+      }
+    }
+  }
+
+  snprintf(isoOut, outCap, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, MM, dd, uh, um, us);
+  return true;
+}
+
+
+// ============== "HH:MM:SS" ==============
+bool getNetworkHHMMSS(char* hms, size_t cap) {
+  char resp[96] = { 0 };
+  sendCommandGetResponse("AT+CCLK?", resp, sizeof(resp), 2000);
+
+  const char* p = strchr(resp, '\"');
+  if (!p) return false;
+  const char* q = strchr(p + 1, '\"');
+  if (!q) return false;
+
+  char core[32];
+  size_t n = (size_t)(q - (p + 1));
+  if (n >= sizeof(core)) n = sizeof(core) - 1;
+  memcpy(core, p + 1, n);
+  core[n] = '\0';
+
+  int H = 0, M = 0, S = 0;
+  if (sscanf(core, "%*2d/%*2d/%*2d,%2d:%2d:%2d", &H, &M, &S) != 3) return false;
+
+  if (cap < 9) return false;
+  snprintf(hms, cap, "%02d:%02d:%02d", H, M, S);
+  return true;
+}
+
+// ----------------- HEX helpers -----------------
+void hexEncode(const uint8_t* in, size_t inLen, char* out, size_t outCap, bool uppercase) {
+  static const char* TAB_U = "0123456789ABCDEF";
+  static const char* TAB_L = "0123456789abcdef";
+  const char* TAB = uppercase ? TAB_U : TAB_L;
+
+  size_t need = inLen * 2 + 1;
+  if (outCap < need) {
+    if (outCap) out[0] = '\0';
+    return;
+  }
+
+  size_t o = 0;
+  for (size_t i = 0; i < inLen; i++) {
+    out[o++] = TAB[(in[i] >> 4) & 0x0F];
+    out[o++] = TAB[in[i] & 0x0F];
+  }
+  out[o] = '\0';
+}
+
+bool hexDecode(const char* hex, uint8_t* out, size_t outCap, size_t& outLen) {
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  size_t n = strlen(hex);
+  if (n % 2) return false;
+  size_t bytes = n / 2;
+  if (bytes > outCap) return false;
+  for (size_t i = 0; i < bytes; i++) {
+    int hi = nib(hex[2 * i]);
+    int lo = nib(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  outLen = bytes;
+  return true;
+}
+
+// ----------------- JSON "mini" getters -----------------
+bool jsonGetString(const char* json, const char* key, char* out, size_t cap) {
+  const char* p = strstr(json, key);
+  if (!p) return false;
+  p = strchr(p, ':');
+  if (!p) return false;
+  p = strchr(p, '"');
+  if (!p) return false;
+  p++;
+  const char* e = strchr(p, '"');
+  if (!e) return false;
+  size_t n = (size_t)(e - p);
+  if (n >= cap) n = cap - 1;
+  memcpy(out, p, n);
+  out[n] = '\0';
+  return true;
+}
+bool jsonGetBool(const char* json, const char* key, bool& out) {
+  const char* p = strstr(json, key);
+  if (!p) return false;
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  if (!strncmp(p, "true", 4)) {
+    out = true;
+    return true;
+  }
+  if (!strncmp(p, "false", 5)) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+bool jsonGetInt(const char* json, const char* key, long& out) {
+  const char* p = strstr(json, key);
+  if (!p) return false;
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+  out = strtol(p, NULL, 10);
+  return true;
+}
+
+float readBatteryVolts() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(BATT_VOLTS);
+    delay(2);
+  }
+  float raw = sum / 8.0f;
+  float v_adc = raw * (ADC_VREF / ADC_MAX);               // volts on the pin
+  float v_bat = v_adc * ((R_TOP + R_BOTTOM) / R_BOTTOM);  // voltage divider scale
+  return v_bat;
+}
