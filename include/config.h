@@ -44,7 +44,7 @@ extern const char* CRYPTOKEY;
 
 // Network Mode Selection: 0 = GPRS (Cat-M1/2G), 1 = NB-IoT
 // Change this to switch between GPRS and NB-IoT modes
-#define NETWORK_MODE_NB 1  // 0 = GPRS, 1 = NB-IoT
+#define NETWORK_MODE_NB 0  // 0 = GPRS, 1 = NB-IoT
 
 // =========================================================================
 // WATCHDOG

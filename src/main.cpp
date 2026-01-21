@@ -15,11 +15,14 @@
 ///////////////////////////////////////////////////////////////////////////
 // CREDENTIALS - Change these values from the portal
 ///////////////////////////////////////////////////////////////////////////
-const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-const char* USERNAME = "node_d935168a3a77";
-const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
+// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+// const char* USERNAME = "node_d935168a3a77";
+// const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
 const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
-
+// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+const char* NODE_ID = "nono_pump_001";
+const char* USERNAME = "";
+const char* PASSWORD = "";
 ///////////////////////////////////////////////////////////////////////////
 // MQTT SERVER
 ///////////////////////////////////////////////////////////////////////////
@@ -288,14 +291,14 @@ void RS485_loop();
 
 // Device array for DeviceManager
 Device* devices[] = {
-    &waterMeter,
+    // &waterMeter,
     &modem
 };
 
 // ----------------- SETUP -----------------
 void setup() {
   // WDT_INIT();
-  delay(200);
+  delay(2000);
   pinMode(PWR_ON_PIN, OUTPUT);
   pinMode(PWR_OFF_PIN, OUTPUT);
   pinMode(MODEM_PWR_PIN, OUTPUT);

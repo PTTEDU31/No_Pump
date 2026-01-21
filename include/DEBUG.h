@@ -4,21 +4,21 @@
 #define DIAG false  // <--- Put false to silence the detailed diagnostics
 
 #if DEBUG
-#define DEBUG_PRINT(x) Serial.print(x)
-#define DEBUG_PRINTLN(x) Serial.println(x)
-#define DEBUG_PRINT_F(x, p) Serial.print((x), (p))
-#define DEBUG_PRINTLN_F(x, p) Serial.println((x), (p))
+#define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#define DEBUG_PRINT_F(...) Serial.print(__VA_ARGS__)
+#define DEBUG_PRINTLN_F(...) Serial.println(__VA_ARGS__)
 #else
-#define DEBUG_PRINT(x)
-#define DEBUG_PRINTLN(x)
-#define DEBUG_PRINT_F(x, p)
-#define DEBUG_PRINTLN_F(x, p)
+#define DEBUG_PRINT(...)
+#define DEBUG_PRINTLN(...)
+#define DEBUG_PRINT_F(...)
+#define DEBUG_PRINTLN_F(...)
 #endif
 
 #if DIAG
-#define DIAG_PRINT(x) Serial.print(x)
-#define DIAG_PRINTLN(x) Serial.println(x)
+#define DIAG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DIAG_PRINTLN(...) Serial.println(__VA_ARGS__)
 #else
-#define DIAG_PRINT(x)
-#define DIAG_PRINTLN(x)
+#define DIAG_PRINT(...)
+#define DIAG_PRINTLN(...)
 #endif

@@ -6,7 +6,7 @@
 #include <DFRobot_SIM7070G.h>
 
 // SIM7070G Configuration
-#define MODEM_BAUD_RATE 115200
+#define MODEM_BAUD_RATE 19200
 #define MODEM_POWER_PIN 12
 
 // Network configuration
@@ -16,6 +16,7 @@
 // MQTT Configuration
 #define MQTT_MAX_RECONNECT_ATTEMPTS 3
 #define MQTT_KEEPALIVE_SEC 60
+#define MQTT_BUFFER_SIZE 10  // Maximum number of messages to buffer
 
 // Network mode enumeration
 enum NetworkMode {
@@ -27,20 +28,27 @@ enum NetworkMode {
 enum ModemState {
   MODEM_OFF = 0,
   MODEM_INITIALIZING,
+  MODEM_RESET,
   MODEM_READY,
-  MODEM_GPRS_CONNECTING,
+  MODEM_CHECK_SIM,
+  MODEM_GPRS_CONNECTING_SET_BAUD,
   MODEM_GPRS_CONNECTING_SET_MODE,
   MODEM_GPRS_CONNECTING_WAIT_MODE,
+  MODEM_GPRS_CONNECTING_CHECK_SIGNAL,
   MODEM_GPRS_CONNECTING_ATTACH,
-  MODEM_GPRS_CONNECTING_WAIT_ATTACH,
   MODEM_GPRS_CONNECTED,
-  MODEM_MQTT_CONNECTING,
-  MODEM_MQTT_CONNECTING_OPEN_NET,
-  MODEM_MQTT_CONNECTING_WAIT_OPEN,
-  MODEM_MQTT_CONNECTING_HANDSHAKE,
-  MODEM_MQTT_CONNECTING_WAIT_HANDSHAKE,
+  MODEM_MQTT_CONNECTING_HANDSHAKE,  // Now uses AT+SMCONN
+  MODEM_MQTT_CONNECTED_FIRST,
   MODEM_MQTT_CONNECTED,
   MODEM_ERROR
+};
+
+// Message buffer structure
+struct MQTTMessage {
+  unsigned long timestamp;  // millis() when message was queued
+  char topic[96];          // MQTT topic
+  char payload[256];       // Message payload
+  uint8_t qos;            // Quality of Service
 };
 
 // Statistics structure
@@ -77,17 +85,10 @@ public:
   bool restart();
   
   // Network management
-  bool connectGPRS();
-  bool disconnectGPRS();
   bool isGPRSConnected();
-  
-  bool connectNB();
-  bool disconnectNB();
   bool isNBConnected();
   
   // MQTT management
-  bool connectMQTT(const char* broker, uint16_t port, 
-                   const char* clientId, const char* username, const char* password);
   bool disconnectMQTT();
   bool isMQTTConnected();
   bool publish(const char* topic, const char* payload, uint8_t qos = 0);
@@ -116,9 +117,6 @@ public:
   void setMQTTCredentials(const char* broker, uint16_t port, 
                           const char* clientId, const char* username, const char* password);
   void setNetworkCredentials(const char* apn, const char* user, const char* pass, NetworkMode mode = NET_MODE_GPRS);
-  void setGPRSCredentials(const char* apn, const char* user, const char* pass) { 
-    setNetworkCredentials(apn, user, pass, NET_MODE_GPRS); 
-  }
   
 private:
   HardwareSerial* _modemSerial;
@@ -149,13 +147,25 @@ private:
   unsigned long _lastNetworkCheck;
   unsigned long _lastStateChange;
   unsigned long _stateStartTime;  // Timestamp when entering current state
+  uint8_t _retryCount;  // Retry counter for state operations
+  
+  // Message buffer
+  MQTTMessage _messageBuffer[MQTT_BUFFER_SIZE];
+  uint8_t _bufferHead;   // Write position
+  uint8_t _bufferTail;   // Read position
+  uint8_t _bufferCount;  // Number of messages in buffer
   
   // Internal methods
   bool applyBootConfig();
   bool checkModemAlive();
   void updateState(ModemState newState);
-  bool waitForResponse(const char* expected, unsigned long timeout);
   void handleIncomingData();
+  
+  // Buffer management methods
+  bool enqueueMessage(const char* topic, const char* payload, uint8_t qos);
+  bool dequeueMessage(MQTTMessage& msg);
+  void clearMessageBuffer();
+  bool flushMessageBuffer();
 };
 
 #endif // SIM7070G_DEVICE_H
