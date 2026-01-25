@@ -3,14 +3,14 @@
 
 #include <Arduino.h>
 #include "device.h"
-#include <DFRobot_SIM7070G.h>
+#include <Sim7070G.h>
 
 // SIM7070G Configuration
 #define MODEM_BAUD_RATE 19200
 #define MODEM_POWER_PIN 12
 
 // Network configuration
-#define PDP_CONTEXT_ID 1
+#define PDP_CONTEXT_ID 0 // 0 is the default context
 #define APN_NAME "iot.1nce.net"
 
 // MQTT Configuration
@@ -18,11 +18,6 @@
 #define MQTT_KEEPALIVE_SEC 60
 #define MQTT_BUFFER_SIZE 10  // Maximum number of messages to buffer
 
-// Network mode enumeration
-enum NetworkMode {
-  NET_MODE_GPRS = 0,
-  NET_MODE_NB = 1
-};
 
 // Connection states
 enum ModemState {
@@ -37,14 +32,19 @@ enum ModemState {
   MODEM_GPRS_CONNECTING_CHECK_SIGNAL,
   MODEM_GPRS_CONNECTING_ATTACH,
   MODEM_GPRS_CONNECTED,
-  MODEM_MQTT_CONNECTING_HANDSHAKE,  // Now uses AT+SMCONN
+  MODEM_GPRS_WAIT_CONNECTION,
+  MODEM_GPRS_IP_CHECK,
+  MODEM_QUERY_NETWORK_INFO,  // Query network info async
+  MODEM_MQTT_CONNECTING_HANDSHAKE,
+  MODEM_MQTT_CONNECTING,
   MODEM_MQTT_CONNECTED_FIRST,
+  MODEM_GPRS_CONNECTING_PDP_CONTEXT,
   MODEM_MQTT_CONNECTED,
   MODEM_ERROR
 };
 
-// Message buffer structure
-struct MQTTMessage {
+// Message buffer structure (renamed to avoid conflict with Sim7070G::MQTTMessage)
+struct MQTTBufferedMessage {
   unsigned long timestamp;  // millis() when message was queued
   char topic[96];          // MQTT topic
   char payload[256];       // Message payload
@@ -73,54 +73,22 @@ public:
   // Constructor
   Sim7070GDevice(HardwareSerial* modemSerial, const char* nodeId);
   
+  // Destructor
+  ~Sim7070GDevice();
+  
   // Override Device methods
   bool initialize() override;
   int start() override;
   int timeout() override;
   int event() override;
   
-  // Modem control
-  bool powerOn();
-  bool powerOff();
-  bool restart();
-  
-  // Network management
-  bool isGPRSConnected();
-  bool isNBConnected();
-  
-  // MQTT management
-  bool disconnectMQTT();
-  bool isMQTTConnected();
-  bool publish(const char* topic, const char* payload, uint8_t qos = 0);
-  bool subscribe(const char* topic, uint8_t qos = 0);
-  bool unsubscribe(const char* topic);
-  bool receiveMQTT(char* topic, char* payload, int maxLen);
-  
-  // AT commands
-  bool sendAT(const char* cmd, unsigned long timeout = 1000);
-  bool sendATwaitOK(const char* cmd, char* response, size_t responseSize, unsigned long timeout = 2500);
-  
-  // Network info
-  int8_t getRSSI();
-  bool getNetworkTime(char* isoTime, size_t size);
-  
-  // State management
-  ModemState getState() const { return _state; }
-  const char* getStateString() const;
-  
-  // Statistics
-  ModemStats getStats() const { return _stats; }
-  void resetStats();
-  
-  // Configuration
-  void setTopics(const char* pubTopic, const char* subTopic);
-  void setMQTTCredentials(const char* broker, uint16_t port, 
-                          const char* clientId, const char* username, const char* password);
-  void setNetworkCredentials(const char* apn, const char* user, const char* pass, NetworkMode mode = NET_MODE_GPRS);
-  
 private:
+  static Sim7070GDevice* s_instance;
+  static void mqttMessageThunk(const char* topic, const uint8_t* payload, uint32_t len);
+
   HardwareSerial* _modemSerial;
-  DFRobot_SIM7070G* _modem;
+  Sim7070G* _modem;
+  bool _mqttBegun = false;
   
   const char* _nodeId;
   char _pubTopic[96];
@@ -140,7 +108,7 @@ private:
   char _apn[64];
   char _gprsUser[64];
   char _gprsPass[64];
-  NetworkMode _networkMode;
+  // NetworkMode _networkMode;
   
   // Timing
   unsigned long _lastHealthCheck;
@@ -148,9 +116,10 @@ private:
   unsigned long _lastStateChange;
   unsigned long _stateStartTime;  // Timestamp when entering current state
   uint8_t _retryCount;  // Retry counter for state operations
+  unsigned long _lastHeartbeatMs = 0;
   
   // Message buffer
-  MQTTMessage _messageBuffer[MQTT_BUFFER_SIZE];
+  MQTTBufferedMessage _messageBuffer[MQTT_BUFFER_SIZE];
   uint8_t _bufferHead;   // Write position
   uint8_t _bufferTail;   // Read position
   uint8_t _bufferCount;  // Number of messages in buffer
@@ -160,10 +129,22 @@ private:
   bool checkModemAlive();
   void updateState(ModemState newState);
   void handleIncomingData();
+  void onMqttMessage(const char* topic, const uint8_t* payload, uint32_t len);
+  void powerPulse();
+  bool ensureNetworkReady();
+  bool ensureMqttReady();
+  
+  // Async command callback handlers
+  static void onQueryNetworkInfoCallback(ATResponseType type, const char* response, void* userData);
+  static void onMqttConnectCallback(ATResponseType type, const char* response, void* userData);
+  bool _networkInfoQueryPending;  // Flag to track if query is pending
+  bool _networkInfoQueryCompleted; // Flag to track if query completed
+  bool _mqttConnectPending;  // Flag to track if MQTT connect is pending
+  bool _mqttConnectCompleted; // Flag to track if MQTT connect completed
   
   // Buffer management methods
   bool enqueueMessage(const char* topic, const char* payload, uint8_t qos);
-  bool dequeueMessage(MQTTMessage& msg);
+  bool dequeueMessage(MQTTBufferedMessage& msg);
   void clearMessageBuffer();
   bool flushMessageBuffer();
 };
