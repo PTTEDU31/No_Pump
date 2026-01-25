@@ -273,23 +273,23 @@ void loop() {
   // Update all devices via DeviceManager (handles timeout callbacks)
   DeviceManager::getInstance().update(millis());
   
-  // Read sensors periodically (every 1 second)
-  if ((long)(millis() - lastSensorRead) >= 1000L) {
-    lastSensorRead = millis();
-    readAllSensors();
+  // // Read sensors periodically (every 1 second)
+  // if ((long)(millis() - lastSensorRead) >= 1000L) {
+  //   lastSensorRead = millis();
+  //   readAllSensors();
     
-    // Update pump status and edge detection
-    servicePumpEdgeAndStatus();
+  //   // Update pump status and edge detection
+  //   servicePumpEdgeAndStatus();
     
-    // Service protection timer
-    serviceStartProtection();
-  }
+  //   // Service protection timer
+  //   serviceStartProtection();
+  // }
   
-  // Print CPU temperature periodically
-  printCPUTemperature();
+  // // Print CPU temperature periodically
+  // printCPUTemperature();
   
-  // Safety loop for relay latch
-  latchRelaySafetyLoop();
+  // // Safety loop for relay latch
+  // latchRelaySafetyLoop();
 }
 
 

@@ -148,6 +148,56 @@ public:
   bool socketSetTransparentMode(int socketId, bool enable);
   bool socketSwitchTransparent(int socketId, bool enable);
 
+  // NTP Time Synchronization
+  /**
+   * Synchronize time with NTP server via CNTP command
+   * @param cid PDP context ID (default: 1)
+   * @param server NTP server hostname (default: "time.google.com")
+   * @param waitTotalMs Total timeout in milliseconds (default: 12000)
+   * @return true if synchronization successful
+   */
+  bool syncTimeUTC_viaCNTP(uint8_t cid = 1, const char* server = "time.google.com", uint32_t waitTotalMs = 12000);
+  
+  /**
+   * Try multiple NTP servers until one succeeds
+   * @param cid PDP context ID (default: 1)
+   * @param waitTotalMs Total timeout per server in milliseconds (default: 12000)
+   * @return true if synchronization successful with any server
+   */
+  bool syncTimeUTC_any(uint8_t cid = 1, uint32_t waitTotalMs = 12000);
+  
+  /**
+   * Get network time in ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ)
+   * @param isoOut Output buffer (must be at least 21 bytes)
+   * @param outCap Buffer capacity
+   * @return true if time retrieved successfully
+   */
+  bool getNetworkTimeISO8601(char* isoOut, size_t outCap);
+  
+  /**
+   * Parse CCLK response to ISO-8601 format
+   * @param cclkResp CCLK response string
+   * @param isoOut Output buffer (must be at least 21 bytes)
+   * @param outCap Buffer capacity
+   * @return true if parsing successful
+   */
+  bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap);
+  
+  /**
+   * Get network time in HH:MM:SS format
+   * @param hms Output buffer (must be at least 9 bytes)
+   * @param cap Buffer capacity
+   * @return true if time retrieved successfully
+   */
+  bool getNetworkHHMMSS(char* hms, size_t cap);
+  
+  /**
+   * Set timezone (AT+CTZR command)
+   * @param timezone Timezone offset in quarter-hours (e.g., 28 for GMT+7, -8 for GMT-2)
+   * @return true if timezone set successfully
+   */
+  bool setTimezone(int8_t timezone);
+
   // Statistics
   uint32_t getATCommandCount() const { return _atCommandCount; }
   uint32_t getATErrorCount() const { return _atErrorCount; }

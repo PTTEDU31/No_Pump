@@ -166,8 +166,16 @@ bool Sim7070GDevice::applyBootConfig()
     DEBUG_PRINTLN(F("[SIM7070G] Failed to set network mode"));
     return false;
   }
-  _modem->sendCommandSync("AT+CFUN=1,1",10);
-  DEBUG_PRINTLN(F("[SIM7070G] Modem soft reset to apply boot config"));
+  
+  // Step 3: Set timezone to GMT+7 (Vietnam timezone)
+  // GMT+7 = 7 * 4 = 28 quarter-hours
+  if (!_modem->setTimezone(28)) {
+    DEBUG_PRINTLN(F("[SIM7070G] Failed to set timezone, continuing anyway..."));
+    // Don't fail boot config if timezone setting fails
+  }
+  
+  // _modem->sendCommandSync("AT+CFUN=1,1",10);
+  // DEBUG_PRINTLN(F("[SIM7070G] Modem soft reset to apply boot config"));
   return true;
 }
   
@@ -352,7 +360,7 @@ int Sim7070GDevice::timeout()
       return 10000;
     }
     updateState(MODEM_QUERY_NETWORK_INFO);
-    return 15000;
+    return 5000;
   }
   case MODEM_GPRS_CONNECTING_ATTACH:
     // Process async operations
@@ -475,7 +483,7 @@ int Sim7070GDevice::timeout()
       updateState(MODEM_GPRS_IP_CHECK);
       return 10000;
     }
-    
+
     return 500;
   }
   case MODEM_GPRS_IP_CHECK:
@@ -488,10 +496,62 @@ int Sim7070GDevice::timeout()
 
     if(_modem->getIPAddress(ip, sizeof(ip)))
     {
-      updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
-      return 5000;
+      DEBUG_PRINT(F("[SIM7070G] Got IP address: "));
+      DEBUG_PRINTLN(ip);
+      updateState(MODEM_SYNC_NTP_TIME);
+      _retryCount = 0;
+      return DURATION_IMMEDIATELY;
     }
     return 10000;
+  }
+  case MODEM_SYNC_NTP_TIME:
+  {
+    // Process async operations
+    if (_modem) {
+      _modem->loop();
+    }
+    
+    DEBUG_PRINTLN(F("[SIM7070G] Synchronizing NTP time..."));
+    
+    // Try to sync NTP time with multiple servers
+    bool ntpSuccess = _modem->syncTimeUTC_any(PDP_CONTEXT_ID, 12000);
+    
+    if (ntpSuccess)
+    {
+      // Get and print the synchronized time
+      char isoTime[21];
+      if (_modem->getNetworkTimeISO8601(isoTime, sizeof(isoTime)))
+      {
+        DEBUG_PRINT(F("[SIM7070G] NTP sync successful. Current time: "));
+        DEBUG_PRINTLN(isoTime);
+      }
+      else
+      {
+        DEBUG_PRINTLN(F("[SIM7070G] NTP sync successful but failed to get ISO time"));
+      }
+      
+      // Move to MQTT connection
+      updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
+      _retryCount = 0;
+      return DURATION_IMMEDIATELY;
+    }
+    else
+    {
+      // NTP sync failed, but continue anyway (don't block MQTT connection)
+      DEBUG_PRINTLN(F("[SIM7070G] NTP sync failed, continuing to MQTT connection..."));
+      _retryCount++;
+      
+      // Retry NTP sync up to 2 times, then continue anyway
+      if (_retryCount >= 2)
+      {
+        DEBUG_PRINTLN(F("[SIM7070G] NTP sync failed after retries, proceeding to MQTT"));
+        updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
+        _retryCount = 0;
+        return DURATION_IMMEDIATELY;
+      }
+      
+      return 5000; // Retry NTP sync after 5 seconds
+    }
   }
   case MODEM_MQTT_CONNECTING_HANDSHAKE:
   {

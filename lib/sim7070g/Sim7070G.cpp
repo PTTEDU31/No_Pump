@@ -699,7 +699,7 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   char cmd[256];
 
   // Set server URL
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",%s,%d", _mqttServer, _mqttPort);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\",\"%d\"", _mqttServer, _mqttPort);
   if (!checkSendCommandSync(cmd, "OK", 20000))
     return false;
   delay(100);
@@ -709,7 +709,7 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
   // Set client ID
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",%s", _mqttClientId);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", _mqttClientId);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
   // Set clean session
@@ -719,14 +719,14 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   // Set username if provided
   if(_mqttUsername[0] != '\0')
   {
-    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",%s", _mqttUsername);
+    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
   }
   // Set password if provided
   if(_mqttPassword[0] != '\0')
   {
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",%s", _mqttPassword);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
   }
@@ -1529,4 +1529,411 @@ bool Sim7070G::checkSendCommandSync(const char *command, const char *expectedRes
   }
 
   return match;
+}
+
+// ============================================================================
+// NTP TIME SYNCHRONIZATION FUNCTIONS
+// ============================================================================
+
+bool Sim7070G::syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs)
+{
+  char buf[128] = {0};
+  char cmd[96];
+  char timeBefore[160] = {0};
+  char timeAfter[160] = {0};
+
+  DEBUG_PRINT(F("[NTP] Synchronizing with server: "));
+  DEBUG_PRINTLN(server);
+
+  // Capture time BEFORE sync attempt
+  if (!sendCommandSync("AT+CCLK?", 1200, timeBefore, sizeof(timeBefore)))
+  {
+    DEBUG_PRINTLN(F("[NTP] Failed to get time before sync"));
+  }
+
+  // Configure NTP server
+  snprintf(cmd, sizeof(cmd), "AT+CNTPCID=%u", cid);
+  if (!sendCommandSync(cmd, 1200, buf, sizeof(buf)))
+  {
+    DEBUG_PRINTLN(F("[NTP] Failed to set CNTPCID"));
+    return false;
+  }
+
+  snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",0", server);
+  if (!sendCommandSync(cmd, 1500, buf, sizeof(buf)))
+  {
+    DEBUG_PRINTLN(F("[NTP] Failed to configure NTP server"));
+    return false;
+  }
+
+  // Trigger NTP sync
+  if (!sendCommandSync("AT+CNTP", 1500, buf, sizeof(buf)))
+  {
+    DEBUG_PRINTLN(F("[NTP] Failed to trigger NTP sync"));
+    return false;
+  }
+
+  // Poll for result
+  bool ok = false;
+  bool explicitFailure = false;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < waitTotalMs)
+  {
+    memset(buf, 0, sizeof(buf));
+    if (!sendCommandSync("AT+CNTP?", 900, buf, sizeof(buf)))
+    {
+      delay(600);
+      continue;
+    }
+
+    // Parse CNTP response - can be in two formats:
+    // Format 1: "+CNTP: 1" or "+CNTP: 0" (simple status)
+    // Format 2: "+CNTP: <server>,<status>,<offset>,<timezone>" (detailed info)
+    const char* cntpPtr = strstr(buf, "+CNTP:");
+    if (cntpPtr)
+    {
+      // Skip "+CNTP: "
+      cntpPtr += 6;
+      while (*cntpPtr == ' ' || *cntpPtr == '\t')
+      {
+        cntpPtr++;
+      }
+
+      // Try to parse as simple format first: "+CNTP: 1" or "+CNTP: 0"
+      int simpleStatus = -1;
+      if (sscanf(cntpPtr, "%d", &simpleStatus) == 1)
+      {
+        if (simpleStatus == 1)
+        {
+          ok = true;
+          DEBUG_PRINTLN(F("[NTP] Sync successful! (simple format)"));
+          break;
+        }
+        else if (simpleStatus == 0)
+        {
+          explicitFailure = true;
+          DEBUG_PRINTLN(F("[NTP] Explicit failure (+CNTP: 0)"));
+          break;
+        }
+      }
+      else
+      {
+        // Try to parse as detailed format: "+CNTP: <server>,<status>,<offset>,<timezone>"
+        char serverName[64];
+        int status = -1;
+        int offset = 0;
+        int timezone = 0;
+        
+        // Parse format: "server",status,offset,timezone or server,status,offset,timezone
+        if (sscanf(cntpPtr, "\"%63[^\"]\",%d,%d,%d", serverName, &status, &offset, &timezone) == 4 ||
+            sscanf(cntpPtr, "%63[^,],%d,%d,%d", serverName, &status, &offset, &timezone) == 4)
+        {
+          DEBUG_PRINT(F("[NTP] Response: server="));
+          DEBUG_PRINT(serverName);
+          DEBUG_PRINT(F(", status="));
+          DEBUG_PRINT(status);
+          DEBUG_PRINT(F(", offset="));
+          DEBUG_PRINT(offset);
+          DEBUG_PRINT(F(", timezone="));
+          DEBUG_PRINTLN(timezone);
+
+          if (status == 1)
+          {
+            ok = true;
+            DEBUG_PRINTLN(F("[NTP] Sync successful! (detailed format)"));
+            break;
+          }
+          else if (status == 0)
+          {
+            // Status is 0, but might still be syncing, so don't mark as failure yet
+            // Continue polling
+            DEBUG_PRINTLN(F("[NTP] Status is 0, still syncing..."));
+          }
+        }
+        else
+        {
+          DEBUG_PRINT(F("[NTP] Could not parse CNTP response: "));
+          DEBUG_PRINTLN(cntpPtr);
+        }
+      }
+    }
+
+    // Check for errors
+    if (strstr(buf, "ERROR") || strstr(buf, "+CME ERROR"))
+    {
+      explicitFailure = true;
+      DEBUG_PRINTLN(F("[NTP] Error response"));
+      break;
+    }
+
+    delay(600);
+  }
+
+  if (!ok && !explicitFailure)
+  {
+    DEBUG_PRINTLN(F("[NTP] Timeout waiting for response"));
+  }
+
+  // Capture time AFTER sync attempt
+  if (!sendCommandSync("AT+CCLK?", 1200, timeAfter, sizeof(timeAfter)))
+  {
+    DEBUG_PRINTLN(F("[NTP] Failed to get time after sync"));
+  }
+
+  // Verify time actually changed (additional validation)
+  if (ok && strcmp(timeBefore, timeAfter) == 0)
+  {
+    DEBUG_PRINTLN(F("[NTP] Warning: Time didn't change after NTP sync"));
+  }
+
+  DEBUG_PRINT(F("[NTP] Time before: "));
+  DEBUG_PRINTLN(timeBefore);
+  DEBUG_PRINT(F("[NTP] Time after:  "));
+  DEBUG_PRINTLN(timeAfter);
+
+  if (ok)
+  {
+    DEBUG_PRINTLN(F("[NTP] Time synchronized successfully"));
+  }
+  else
+  {
+    DEBUG_PRINT(F("[NTP] Failed to synchronize with "));
+    DEBUG_PRINTLN(server);
+  }
+
+  return ok;
+}
+
+bool Sim7070G::syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs)
+{
+  // Order them by preference
+  const char* servers[] = {
+    "time.google.com",
+    "time.cloudflare.com",
+    "pool.ntp.org",
+    "time.windows.com",
+    "time.nist.gov"
+  };
+  const size_t nServers = sizeof(servers) / sizeof(servers[0]);
+
+  for (size_t i = 0; i < nServers; i++)
+  {
+    DEBUG_PRINT(F("[NTP] Trying server: "));
+    DEBUG_PRINTLN(servers[i]);
+
+    if (syncTimeUTC_viaCNTP(cid, servers[i], waitTotalMs))
+    {
+      DEBUG_PRINT(F("[NTP] Time synchronized using: "));
+      DEBUG_PRINTLN(servers[i]);
+      return true;
+    }
+  }
+
+  DEBUG_PRINTLN(F("[NTP] All NTP servers failed. Keeping previous clock / network time."));
+  return false;
+}
+
+bool Sim7070G::getNetworkTimeISO8601(char* isoOut, size_t outCap)
+{
+  if (!isoOut || outCap < 21)
+  {
+    return false;
+  }
+
+  char resp[96] = {0};
+  if (!sendCommandSync("AT+CCLK?", 1500, resp, sizeof(resp)))
+  {
+    return false;
+  }
+
+  if (strstr(resp, "+CCLK:") == NULL)
+  {
+    return false;
+  }
+
+  return parseCCLKToISO(resp, isoOut, outCap);
+}
+
+bool Sim7070G::parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap)
+{
+  if (!cclkResp || !isoOut || outCap < 21)
+  {
+    return false;  // "YYYY-MM-DDTHH:MM:SSZ"+NUL
+  }
+
+  const char* p = strchr(cclkResp, '\"');
+  if (!p)
+  {
+    return false;
+  }
+  const char* q = strchr(p + 1, '\"');
+  if (!q)
+  {
+    return false;
+  }
+
+  char core[32];
+  size_t n = (size_t)(q - (p + 1));
+  if (n >= sizeof(core))
+  {
+    n = sizeof(core) - 1;
+  }
+  memcpy(core, p + 1, n);
+  core[n] = '\0';
+
+  int yy = 0, MM = 0, dd = 0, hh = 0, mi = 0, ss = 0;
+  char tzStr[6] = {0};
+  int scanned = sscanf(core, "%2d/%2d/%2d,%2d:%2d:%2d%5s", &yy, &MM, &dd, &hh, &mi, &ss, tzStr);
+  if (scanned < 7)
+  {
+    return false;
+  }
+
+  int y = (yy <= 69) ? (2000 + yy) : (1900 + yy);
+
+  int tzQuarter = atoi(tzStr);
+  long totalMin = (long)hh * 60L + (long)mi - (long)tzQuarter * 15L;
+
+  int dayShift = 0;
+  if (totalMin < 0)
+  {
+    totalMin += 1440;
+    dayShift = -1;
+  }
+  else if (totalMin >= 1440)
+  {
+    totalMin -= 1440;
+    dayShift = 1;
+  }
+
+  int uh = (int)(totalMin / 60L);
+  int um = (int)(totalMin % 60L);
+  int us = ss;
+
+  auto isLeap = [](int Y) -> bool {
+    return ((Y % 4 == 0) && (Y % 100 != 0)) || (Y % 400 == 0);
+  };
+  auto dim = [&](int Y, int M) -> int {
+    switch (M)
+    {
+      case 1: return 31;
+      case 2: return isLeap(Y) ? 29 : 28;
+      case 3: return 31;
+      case 4: return 30;
+      case 5: return 31;
+      case 6: return 30;
+      case 7: return 31;
+      case 8: return 31;
+      case 9: return 30;
+      case 10: return 31;
+      case 11: return 30;
+      case 12: return 31;
+      default: return 30;
+    }
+  };
+
+  if (dayShift == -1)
+  {
+    dd -= 1;
+    if (dd <= 0)
+    {
+      MM -= 1;
+      if (MM <= 0)
+      {
+        MM = 12;
+        y -= 1;
+      }
+      dd = dim(y, MM);
+    }
+  }
+  else if (dayShift == 1)
+  {
+    dd += 1;
+    if (dd > dim(y, MM))
+    {
+      dd = 1;
+      MM += 1;
+      if (MM > 12)
+      {
+        MM = 1;
+        y += 1;
+      }
+    }
+  }
+
+  snprintf(isoOut, outCap, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, MM, dd, uh, um, us);
+  return true;
+}
+
+bool Sim7070G::getNetworkHHMMSS(char* hms, size_t cap)
+{
+  if (!hms || cap < 9)
+  {
+    return false;
+  }
+
+  char resp[96] = {0};
+  if (!sendCommandSync("AT+CCLK?", 2000, resp, sizeof(resp)))
+  {
+    return false;
+  }
+
+  const char* p = strchr(resp, '\"');
+  if (!p)
+  {
+    return false;
+  }
+  const char* q = strchr(p + 1, '\"');
+  if (!q)
+  {
+    return false;
+  }
+
+  char core[32];
+  size_t n = (size_t)(q - (p + 1));
+  if (n >= sizeof(core))
+  {
+    n = sizeof(core) - 1;
+  }
+  memcpy(core, p + 1, n);
+  core[n] = '\0';
+
+  int H = 0, M = 0, S = 0;
+  if (sscanf(core, "%*2d/%*2d/%*2d,%2d:%2d:%2d", &H, &M, &S) != 3)
+  {
+    return false;
+  }
+
+  snprintf(hms, cap, "%02d:%02d:%02d", H, M, S);
+  return true;
+}
+
+bool Sim7070G::setTimezone(int8_t timezone)
+{
+  // AT+CTZR=<timezone> where timezone is in quarter-hours
+  // GMT+7 = 7 * 4 = 28 quarter-hours
+  // GMT-2 = -2 * 4 = -8 quarter-hours
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CTZR=%d", timezone);
+  
+  DEBUG_PRINT(F("[TIMEZONE] Setting timezone to "));
+  DEBUG_PRINT(timezone);
+  DEBUG_PRINT(F(" quarter-hours (GMT"));
+  if (timezone >= 0) {
+    DEBUG_PRINT(F("+"));
+  }
+  DEBUG_PRINT((float)timezone / 4.0f);
+  DEBUG_PRINTLN(F(")"));
+  
+  if (sendCommandSync(cmd, 2000))
+  {
+    DEBUG_PRINTLN(F("[TIMEZONE] Timezone set successfully"));
+    return true;
+  }
+  else
+  {
+    DEBUG_PRINTLN(F("[TIMEZONE] Failed to set timezone"));
+    return false;
+  }
 }
