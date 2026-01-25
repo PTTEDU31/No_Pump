@@ -6,85 +6,151 @@
 #include <ChaChaPoly.h>
 #include <math.h>
 #include "wiring_private.h"
-#include "config.h"
-#include "ModbusWaterMeter.h"
-#include "device.h"
-#include "DEBUG.h"
-#include "Sim7070GDevice.h"
+///////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+// Change the secrets from the portal to the following fields in the corresponding variables
 
-///////////////////////////////////////////////////////////////////////////
-// CREDENTIALS - Change these values from the portal
-///////////////////////////////////////////////////////////////////////////
-// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-// const char* USERNAME = "node_d935168a3a77";
-// const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
+const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+const char* USERNAME = "node_d935168a3a77";
+const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
 const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
-// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-const char* NODE_ID = "nono_pump_001";
-const char* USERNAME = "";
-const char* PASSWORD = "";
-///////////////////////////////////////////////////////////////////////////
-// MQTT SERVER
-///////////////////////////////////////////////////////////////////////////
-const char mqtt_server[] = "mqtt.myvpn.id.vn";
-const int mqtt_port = 1883;
 
 ///////////////////////////////////////////////////////////////////////////
-// GLOBAL OBJECTS
 ///////////////////////////////////////////////////////////////////////////
+
 TemperatureZero tempSAMD;
 
-// Watchdog helpers
+// ----------------- CONFIG DEBUG/DIAGNOSTIC -----------------
+#define DEBUG true  // <--- Put false to silence the serial prints in the monitor
+#define DIAG false  // <--- Put false to silence the detailed diagnostics
+
+#if DEBUG
+#define DEBUG_PRINT(x) Serial.print(x)
+#define DEBUG_PRINTLN(x) Serial.println(x)
+#define DEBUG_PRINT_F(x, p) Serial.print((x), (p))
+#define DEBUG_PRINTLN_F(x, p) Serial.println((x), (p))
+#else
+#define DEBUG_PRINT(x)
+#define DEBUG_PRINTLN(x)
+#define DEBUG_PRINT_F(x, p)
+#define DEBUG_PRINTLN_F(x, p)
+#endif
+
+#if DIAG
+#define DIAG_PRINT(x) Serial.print(x)
+#define DIAG_PRINTLN(x) Serial.println(x)
+#else
+#define DIAG_PRINT(x)
+#define DIAG_PRINTLN(x)
+#endif
+
+// ----------------- PINS -----------------
+#define sim7070 Serial1
+#define MODEM_PWR_PIN 12  // Pin to turn on/off the modem
+#define CONTACT_PIN 20    // Pin to detect whether the pump is on or off
+#define PWR_ON_PIN 4      // Pin to turn un pump (on relay)
+#define PWR_OFF_PIN 3     // Pin to turn pump off (off relay)
+
+#define ADC_PIN_1 A0       // AC Transducer input (line 1)
+#define ADC_PIN_2 A1       // AC Transducer input (line 2)
+#define ADC_PIN_3 A2       // AC Transducer input (line 3)
+#define BATT_VOLTS A3      // Battery voltage input pin
+#define Input_Supply_V 21  // Main power detection pin (detects whether there is power from the main line)
+
+#define RS485_RX_PIN 5  // PIN RX for RS485 module
+#define RS485_TX_PIN 6  // PIN TX for RS485 module
+
+// ----------------- PDP CONTEXT -----------------
+#define PDP_CID 1
+#define PDP_APN "iot.1nce.net"
+
+// ----------------- WATCHDOG -----------------
+#define HW_WDT_TIMEOUT_SEC 16
 static inline void WDT_INIT() {
   Watchdog.enable(HW_WDT_TIMEOUT_SEC * 1000);
 }
 static inline void WDT_RESET() {
   Watchdog.reset();
 }
-///////////////////////////////////////////////////////////////////////////
-// RUNTIME STATE VARIABLES
-///////////////////////////////////////////////////////////////////////////
+
+// ----------------- MQTT -----------------
+const char mqtt_server[] = "broker.remotextr.com";
+const int mqtt_port = 1883;
 char topic_sub[96];
 char topic_pub[96];
 char clientID[64];
+
 char mqtt_username[64];
 char mqtt_password[64];
 
+
+// ====== CRYPTO =======
 static const char* KEY_HEX = CRYPTOKEY;
 static uint8_t CRYPTO_KEY[32];
 
+// ----------------- MQTT STATE -----------------
 bool mqttConnected = false;
 unsigned long lastPublish = 0;
-bool prevPwrOn = false;
+
+// ---- PUBLISH / BATTERY (CONFIGURABLE) ----
+constexpr int BAT_THRESH_PCT = 90;              // Battery percentage threshold that changes publication times
+constexpr int BAT_HYST_PCT = 3;                 // Hysteresis to change publication time (this avoids jumping configuration)
+constexpr unsigned long PUB_FAST_MS = 15000UL;  // Fast publication (when above battery threshold)
+constexpr unsigned long PUB_SLOW_MS = 30000UL;  // Slow publication (when below battery threshold)
+
+// PREVIOUS STATE OF THE MAIN POWER LINE ----------
+bool prevPwrOn = false;  // it is initialized in setup()
+
 unsigned long publishIntervalMs = PUB_FAST_MS;
+
+// -------------CHECK CONNECTIONS INTERVAL----
 unsigned long lastCheck = 0;
+const unsigned long checkInterval = 15000;
 
 byte pump = 0;
-int onPulse = ON_PULSE_MS;
+int onPulse = 5000;
 bool serverOnCommand = false;
 String receivedMessage = "";
 
-int readResponseWait = READ_RESPONSE_WAIT_MS;
-int simWait = SIM_WAIT_MS;
+// TIMINGS
+int readResponseWait = 300;
+int simWait = 1000;
 
+// ===== UART Quiet Period =====
 static unsigned long lastUartActivity = 0;
+const unsigned long healthQuietMs = 2000;
 inline void noteUartActivity() {
   lastUartActivity = millis();
 }
 inline bool canRunHealthCheck() {
-  return (millis() - lastUartActivity) > HEALTH_QUIET_MS;
+  return (millis() - lastUartActivity) > healthQuietMs;
 }
+// === ADJUSTABLE TIMING CONSTANTS FOR FUNCTION modemRestart() ----------
+const unsigned long PWRKEY_MS = 1600;     // valid pulse (1.5–2.0 s)
+const unsigned long PRE_DRAIN_MS = 40;    // clean UART backlogs before hitting PWRKEY
+const unsigned long OFF_WAIT_MS = 9000;   // give time if the first toggle was ON->OFF
+const unsigned long BOOT_WAIT_MS = 6000;  // boot time after the final on pulse
 
-volatile uint32_t cntModemRestarts = 0;
-volatile uint32_t cntGprsConnects = 0;
-volatile uint32_t cntMqttConnects = 0;
+// ---- COUNTERS FOR RESTARTS/RECONNECTIONS ----
+volatile uint32_t cntModemRestarts = 0;          // restarts via PWRKEY
+volatile uint32_t cntGprsConnects = 0;           // successful PDP activations
+volatile uint32_t cntMqttConnects = 0;           // successful MQTT connections
+const unsigned long ReconnIntervalMs = 10000UL;  // 10 s
+
+// --------- RESTART DEBOUNCE ------------
 
 unsigned long lastRestartMs = 0;
-unsigned long lastTempCheck = 0;
+const unsigned long minRestartGapMs = 15000;
 
+// -------- MONITOR CPU TEMPERATURE -----------
+unsigned long lastTempCheck = 0;
+const unsigned long tempInterval = 10000;
+
+// -------- VIBRATION ---------
 int vibrationCount = 0;
 int EventCountTotal = 0;
 
+// ---- MODEM HEALTH (anti-false negatives) ----
 static uint8_t atFailStreak = 0;
 static uint8_t gprsFailStreak = 0;
 static uint8_t mqttFailStreak = 0;
@@ -93,30 +159,49 @@ static unsigned long lastATokMs = 0;
 static unsigned long lastGPRSokMs = 0;
 static unsigned long lastMQTTokMs = 0;
 
+// --------- VARIABLES FOR FUNCTION checkConnections()
+const uint8_t AT_FAILS_BEFORE_RESTART = 2;    // more tolerant; initially 6
+const uint8_t GPRS_FAILS_BEFORE_RESTART = 3;  // initially 3
+const uint8_t MQTT_FAILS_BEFORE_RESTART = 3;  // initially 3
+
+const unsigned long recentOkGraceMs = 16000UL;  // initially 180000 (3 min) of "grace" if it recently was OK
+
+// ---- PUMP ON-PROTECTION  ----
+const unsigned long PROTECT_ON_MS = 120000UL;   // 2 minutes
+const unsigned long PROTECT_TICK_MS = 10000UL;  // 10 second announcement
+
 volatile bool protectOnStart = false;
 unsigned long protectStartMs = 0;
 unsigned long protectLastAnnounce = 0;
-volatile bool lastOffByHexFlag = false;
-bool prevPumpOn = false;
 
-///////////////////////////////////////////////////////////////////////////
-// DEVICE OBJECTS
-///////////////////////////////////////////////////////////////////////////
+// To distinguish if the pump was turned off via HEX (X=0)
+volatile bool lastOffByHexFlag = false;
+
+// To detect "turn off without HEX" by flank
+bool prevPumpOn = false;  // It is initialized in setup() after reading the pin
+
+// VALUES FOR READING THE VOLTAGES OF THE BATTERIES
+constexpr float ADC_VREF = 3.3f;  // calibrate if the real 3V3 differs
+constexpr float ADC_MAX = 4095.0f;
+
+constexpr float R_TOP = 100000.0f;     // 100k (BAT+ -> node)
+constexpr float R_BOTTOM = 220000.0f;  // 220k (node -> GND)
+
+// ------------- RS 485 ------------------
+
 // We instantiate a UART in SERCOM0
 Uart RS485(&sercom0, RS485_RX_PIN, RS485_TX_PIN, SERCOM_RX_PAD_1, UART_TX_PAD_0);
 
-// Modbus Water Meter Module
-ModbusWaterMeter waterMeter(&RS485);
-
-// SIM7070G Modem Device
-Sim7070GDevice modem(&sim7070, NODE_ID);
-
-///////////////////////////////////////////////////////////////////////////
-// LEGACY VARIABLES (backward compatibility)
-///////////////////////////////////////////////////////////////////////////
 byte messege[256];
 uint8_t index_request = 2;
 float parameters[64];
+
+// Constant water flow address
+#define METER_CURRENT_ADDRESS 0x00000002
+
+// Cumulative water flow address
+#define METER_CUMULATIVE_ADDRESS 0x00380002
+
 
 struct modbus_transmit {
   uint8_t address = 0x01;
@@ -162,10 +247,17 @@ bool getNetworkTimeISO8601(char* isoOut, size_t outCap);
 bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap);
 bool getNetworkHHMMSS(char* hms, size_t cap);
 bool modemAlivePing();
+static inline void applyBootConfig();
 void diagSnapshot(const char* label);
+static inline void servicePumpEdgeAndStatus();
 
 // NEW: ENSURE AT (MODEM ON) BEFORE CFUN/CNACT WHEN CNACT? RETURNS 0 bytes
 static bool ensureATorPowerCycle(uint8_t atAttempts = 3);
+
+// PROTECTION HELPERS
+static inline bool isPumpOn();
+static inline void armStartProtection(const char* motivo);
+static inline void serviceStartProtection();
 
 // HEX HELPERS
 void hexEncode(const uint8_t* in, size_t inLen, char* out, size_t outCap, bool uppercase = true);
@@ -186,94 +278,11 @@ int csqToDbm(int rssi);  // useful optional: converts CSQ to dBm
 // FUNCTION TO READ VOLTAGES
 float readBatteryVolts();
 
-// ========== STATIC INLINE FUNCTION IMPLEMENTATIONS ==========
-static inline bool isPwrPresent() {
-  byte highs = 0;
-  highs += (digitalRead(Input_Supply_V) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(Input_Supply_V) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(Input_Supply_V) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(Input_Supply_V) == HIGH);
-
-  if (highs == 4) {
-    prevPwrOn = true;
-    return true;
-  }
-  if (highs == 0) {
-    prevPwrOn = false;
-    return false;
-  }
-  return prevPwrOn;  // ambiguous zone: keep state
-}
-
-static inline bool isPumpOn() {
-  return digitalRead(CONTACT_PIN) == HIGH;
-}
-
-static inline void armStartProtection(const char* motivo) {
-  protectOnStart = true;
-  protectStartMs = millis();
-  protectLastAnnounce = 0;
-  DEBUG_PRINT(F("[PROTECT] Started: "));
-  DEBUG_PRINTLN(motivo);
-}
-
-static inline void serviceStartProtection() {
-  if (!protectOnStart) return;
-
-  unsigned long elapsed = millis() - protectStartMs;
-
-  if (elapsed >= PROTECT_ON_MS) {
-    protectOnStart = false;
-    DEBUG_PRINTLN(F("[PROTECT] End. Protection time has passed."));
-  } else {
-    if ((millis() - protectLastAnnounce) >= PROTECT_TICK_MS) {
-      protectLastAnnounce = millis();
-      unsigned long remain = (PROTECT_ON_MS - elapsed) / 1000;
-      DEBUG_PRINT(F("[PROTECT] Active. Remain: "));
-      DEBUG_PRINT(remain);
-      DEBUG_PRINTLN(F(" s."));
-    }
-  }
-}
-
-static inline void servicePumpEdgeAndStatus() {
-  bool nowOn = isPumpOn();
-
-  // Detection of flank: ON -> OFF (turned off by contact, without HEX)
-  if (prevPumpOn && !nowOn) {
-    if (!lastOffByHexFlag) {
-      armStartProtection("Turned OFF detected by contact (without HEX)");
-    } else {
-      lastOffByHexFlag = false;
-    }
-  }
-
-  prevPumpOn = nowOn;
-
-  // X (pump): 1 on, 0 off
-  pump = nowOn ? 1 : 0;
-}
-
-static inline void applyBootConfig() {
-  sendAT("ATE0", 400);
-  sendAT("AT+CFUN=1", 600);
-  sendAT("AT+CMEE=2", 300);
-  sendAT("AT+CPIN?", 400);
-  sendAT("AT+CNMP=38", 400);
-  sendAT("AT+CMNB=2", 400);
-  sendAT("AT+CBANDCFG=\"CAT-M\",2", 400);
-  delay(400);
-}
-
-// ========== END STATIC INLINE FUNCTIONS ==========
+// FUNCTION TO SEE IF THERE IS MAIN POWER PRESENT
+static inline bool isPwrPresent();
 
 // Mandatory ISR to manage interruptions of SERCOM0
+
 void SERCOM0_Handler() {
   RS485.IrqHandler();
 }
@@ -285,20 +294,14 @@ uint16_t RTU_Vcrc(uint8_t RTU_Buff[], uint16_t RTU_Leng);
 
 bool PARSING_PARAM(uint32_t data[1]);
 float get_param(uint32_t regAddr);
-void RS485_loop_new();  // New modbus implementation
 
 void RS485_loop();
 
-// Device array for DeviceManager
-Device* devices[] = {
-    // &waterMeter,
-    &modem
-};
 
 // ----------------- SETUP -----------------
 void setup() {
-  // WDT_INIT();
-  delay(2000);
+  WDT_INIT();
+  delay(200);
   pinMode(PWR_ON_PIN, OUTPUT);
   pinMode(PWR_OFF_PIN, OUTPUT);
   pinMode(MODEM_PWR_PIN, OUTPUT);
@@ -308,34 +311,95 @@ void setup() {
 
   pinMode(Input_Supply_V, INPUT);
 
-  // Initialize Serial for debugging
+  // Initializing RS485
   Serial.begin(115200);
-  DEBUG_PRINTLN(F("Starting initialization..."));
-  
-  // Register devices with DeviceManager
-  DeviceManager::getInstance().registerDevices(devices, sizeof(devices) / sizeof(devices[0]));
-  DEBUG_PRINTLN(F("[DEVICE] Devices registered"));
-  
-  // Initialize all devices
-  DeviceManager::getInstance().init();
-  DEBUG_PRINTLN(F("[DEVICE] Devices initialized"));
-  
-  // Start all devices
-  DeviceManager::getInstance().start();
-  DEBUG_PRINTLN(F("[DEVICE] Devices started"));
+  DEBUG_PRINTLN(F("Initializing RS485..."));
+  pinPeripheral(RS485_RX_PIN, PIO_SERCOM_ALT);
+  pinPeripheral(RS485_TX_PIN, PIO_SERCOM_ALT);
+  RS485.begin(9600);
+  delay(100);
+
+
+  sim7070.begin(115200);
+
+  tempSAMD.init();
+  analogReadResolution(12);
+
+  // --- DECODE HEX KEY TO BYTES (CRYPTO_KEY[32]) ---
+  {
+    size_t outLen = 0;
+    if (!hexDecode(KEY_HEX, CRYPTO_KEY, sizeof(CRYPTO_KEY), outLen) || outLen != 32) {
+      DEBUG_PRINTLN(F("ERROR: INVALID CRYPTO KEY (must be 64 hex = 32 bytes)."));
+    } else {
+      DEBUG_PRINTLN(F("CRYPTO KEY loaded from HEX."));
+    }
+  }
+
+  // PUMP INITIAL STATE
+  prevPumpOn = isPumpOn();
+
+  // POWER INITIAL STATE (MAIN LINE)
+  prevPwrOn = isPwrPresent();
+
+  DEBUG_PRINTLN(F("Production_Node_Nano33IoT (115200 bps, CID=1)"));
+  delay(500);
+  WDT_RESET();
+
+  DEBUG_PRINTLN(F("Verifying communication with the SIM7070G"));
+  verifySIMConnected();
+
+  applyBootConfig();
 
   DEBUG_PRINTLN(F("Initializing SIM7070G..."));
+
+  gprsConnect();
+
+  delay(1000);
+
+  WDT_RESET();
+
+  snprintf(topic_sub, sizeof(topic_sub), "xtr/server/%s", NODE_ID);
+  snprintf(topic_pub, sizeof(topic_pub), "xtr/nodes/%s", NODE_ID);
+  snprintf(clientID, sizeof(clientID), "%s", NODE_ID);
+
+  snprintf(mqtt_username, sizeof(mqtt_username), "%s", USERNAME);
+  snprintf(mqtt_password, sizeof(mqtt_password), "%s", PASSWORD);
+
+  mqttConnect();
+
+  WDT_RESET();
+  DEBUG_PRINTLN("Leaving Setup");
 }
 
 // ----------------- LOOP -----------------
 void loop() {
 
-  // WDT_RESET();
-  
-  // Update all devices via DeviceManager (handles timeout callbacks)
-  DeviceManager::getInstance().update(millis());
+  WDT_RESET();
+  serviceStartProtection();
 
+  handleMQTTMessages();
 
+  checkConnections();
+
+  servicePumpEdgeAndStatus();
+
+  //DEBUG_PRINT("Pump On?: ");
+  //DEBUG_PRINTLN(isPumpOn());
+
+  {
+    unsigned long now = millis();
+    if ((long)(now - lastPublish) >= (long)publishIntervalMs) {
+      if (mqttConnected) {
+        RS485_loop();
+        if (publishMessage()) {
+          lastPublish = now;  // We advance to timer only if we have published
+        }
+      } else {
+        lastPublish = now;
+        DEBUG_PRINTLN(F("Skipping publication: MQTT not connected."));
+      }
+    }
+  }
 }
 
 
@@ -518,6 +582,65 @@ void handleMQTTMessages() {
 
 
 
+// ----------------- ON PROTECTION: HELPERS -----------------
+// CONTACT_PIN HIGH = ON, LOW = OFF
+// 4 READINGS WITH 20 ms; 4/4 HIGH => ON, 4/4 LOW => OFF, MIXTURES => KEEPS PREVIOUS STATE
+static inline bool isPumpOn() {
+  byte highs = 0;
+  highs += (digitalRead(CONTACT_PIN) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(CONTACT_PIN) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(CONTACT_PIN) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(CONTACT_PIN) == HIGH);
+
+  if (highs == 4) return true;   // on
+  if (highs == 0) return false;  // off
+  return prevPumpOn;             // ambiguous zone: keep state
+}
+
+static inline void armStartProtection(const char* reason) {
+  protectOnStart = true;
+  protectStartMs = millis();
+  protectLastAnnounce = 0;
+  DEBUG_PRINTLN(F(">>> Time of pump on-protection ACTIVATED (120 s)"));
+  if (reason) {
+    DEBUG_PRINT(F("Reason: "));
+    DEBUG_PRINTLN(reason);
+  }
+}
+
+static inline void serviceStartProtection() {
+  if (!protectOnStart) return;
+
+  unsigned long elapsed = millis() - protectStartMs;
+  if (elapsed >= PROTECT_ON_MS) {
+    protectOnStart = false;
+    DEBUG_PRINTLN(F(">>> Pump on-protection finalized (120 s fulfilled)."));
+    return;
+  }
+
+  if (millis() - protectLastAnnounce >= PROTECT_TICK_MS) {
+    protectLastAnnounce = millis();
+    DEBUG_PRINT(F("Time of on-protection of pump: "));
+    DEBUG_PRINT(elapsed / 1000UL);
+    DEBUG_PRINTLN(F(" s"));
+  }
+}
+
+// MODEM CONFIGURATION
+static inline void applyBootConfig() {
+  //sendAT("ATE0", 150);
+  sendAT("AT+CMEE=2", 120);
+  sendAT("AT+CSOCKSETPN=1", 200);
+  sendAT("AT+SMCONF=\"CONTEXTID\",1", 200);
+  sendAT("AT+CSCLK=0", 150);
+}
+
 // ----------------- DIAGNOSTIC -----------------
 void diagSnapshot(const char* label) {
   if (!DIAG) return;
@@ -544,7 +667,7 @@ void diagSnapshot(const char* label) {
 
 // ----------------- HEALTH/RECONNECTIONS -----------------
 void checkConnections() {
-  if ((long)(millis() - lastCheck) < (long)CHECK_INTERVAL_MS) return;
+  if ((long)(millis() - lastCheck) < (long)checkInterval) return;
 
   if (!canRunHealthCheck()) {
     if (DIAG) DIAG_PRINTLN(F("[DIAG] checkConnections posponed: recent UART activity"));
@@ -583,7 +706,7 @@ void checkConnections() {
     DEBUG_PRINT(F("AT fail streak = "));
     DEBUG_PRINTLN(atFailStreak);
 
-    if ((millis() - lastATokMs) < RECENT_OK_GRACE_MS && atFailStreak < AT_FAILS_BEFORE_RESTART) {
+    if ((millis() - lastATokMs) < recentOkGraceMs && atFailStreak < AT_FAILS_BEFORE_RESTART) {
       DEBUG_PRINTLN(F("Recent Ok and few failures: DO NOT restart (grace period)."));
       return;
     }
@@ -591,7 +714,7 @@ void checkConnections() {
       DEBUG_PRINTLN(F("AT failed under threshold. Will try later."));
       return;
     }
-    if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+    if (millis() - lastRestartMs < minRestartGapMs) {
       DEBUG_PRINTLN(F("Restart blocked by debounce. Waiting for next cycle."));
       return;
     }
@@ -667,7 +790,7 @@ void checkConnections() {
       DEBUG_PRINT(F("GPRS fail streak = "));
       DEBUG_PRINTLN(gprsFailStreak);
 
-      if ((millis() - lastGPRSokMs) < RECENT_OK_GRACE_MS && gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
+      if ((millis() - lastGPRSokMs) < recentOkGraceMs && gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
         DEBUG_PRINTLN(F("GPRS failed but it was OK recently. Do not restart."));
         return;
       }
@@ -675,7 +798,7 @@ void checkConnections() {
         DEBUG_PRINTLN(F("GPRS failed under threshold. Retry later."));
         return;
       }
-      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+      if (millis() - lastRestartMs < minRestartGapMs) {
         DEBUG_PRINTLN(F("GPRS failed; restart blocked by debounce."));
         return;
       }
@@ -718,7 +841,7 @@ void checkConnections() {
       DEBUG_PRINT(F("MQTT fail streak = "));
       DEBUG_PRINTLN(mqttFailStreak);
 
-      if ((millis() - lastMQTTokMs) < RECENT_OK_GRACE_MS && mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
+      if ((millis() - lastMQTTokMs) < recentOkGraceMs && mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
         DEBUG_PRINTLN(F("MQTT failed but it was OK recently. Do not restart."));
         return;
       }
@@ -726,7 +849,7 @@ void checkConnections() {
         DEBUG_PRINTLN(F("MQTT failed under threshold. Retry later."));
         return;
       }
-      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+      if (millis() - lastRestartMs < minRestartGapMs) {
         DEBUG_PRINTLN(F("MQTT failed; restart blocked by debounce."));
         return;
       }
@@ -794,9 +917,9 @@ bool publishMessage() {
       DEBUG_PRINTLN(publishIntervalMs);
     }
   }
-  // RS485 values already updated by RS485_loop_new() right before publishMessage()
-  float FLOW = waterMeter.getCurrentFlow();      // current flow (m³/h)
-  float TOT = waterMeter.getCumulativeFlow();    // cumulative (m³)
+  // RS485 values already updated by RS485_loop() right before publishMessage()
+  float FLOW = parameters[0];  // current flow
+  float TOT = parameters[1];   // cumulative
 
   // AT_UTC
   char tsZ[21] = { 0 };  // "YYYY-MM-DDTHH:MM:SSZ"
@@ -1146,10 +1269,10 @@ void sendAT(const char* command, unsigned long wait) {
 }
 
 bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) {
-  char buf[128] = {0};
+  char buf[128] = { 0 };
   char cmd[96];
-  char timeBefore[160] = {0};
-  char timeAfter[160] = {0};
+  char timeBefore[160] = { 0 };
+  char timeAfter[160] = { 0 };
 
   DEBUG_PRINT(F("[NTP] Synchronizing with server: "));
   DEBUG_PRINTLN(server);
@@ -1651,7 +1774,7 @@ void latchRelaySafetyLoop() {
 }
 
 void printCPUTemperature() {
-  if ((long)millis() - (long)lastTempCheck <= (long)TEMP_CHECK_INTERVAL_MS) return;
+  if ((long)millis() - (long)lastTempCheck <= (long)tempInterval) return;
   lastTempCheck = millis();
 
   float cpuC = tempSAMD.readInternalTemperature();
@@ -1963,6 +2086,24 @@ bool jsonGetInt(const char* json, const char* key, long& out) {
   return true;
 }
 
+static inline void servicePumpEdgeAndStatus() {
+  bool nowOn = isPumpOn();
+
+  // Detection of flank: ON -> OFF (turned off by contact, without HEX)
+  if (prevPumpOn && !nowOn) {
+    if (!lastOffByHexFlag) {
+      armStartProtection("Turned OFF detected by contact (without HEX)");
+    } else {
+      lastOffByHexFlag = false;
+    }
+  }
+
+  prevPumpOn = nowOn;
+
+  // X (pump): 1 on, 0 off
+  pump = nowOn ? 1 : 0;
+}
+
 float readBatteryVolts() {
   long sum = 0;
   for (int i = 0; i < 8; i++) {
@@ -1973,4 +2114,213 @@ float readBatteryVolts() {
   float v_adc = raw * (ADC_VREF / ADC_MAX);               // volts on the pin
   float v_bat = v_adc * ((R_TOP + R_BOTTOM) / R_BOTTOM);  // voltage divider scale
   return v_bat;
+}
+
+// ----------------- Presence of main power line (PWR): helpers -----------------
+// Input_Supply_V HIGH = there is main power line, LOW = there is no main power line
+// 4 readings con 20 ms; 4/4 HIGH => present, 4/4 LOW => missing, mixtures => keeps previous state
+static inline bool isPwrPresent() {
+  byte highs = 0;
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+  delay(20);
+  WDT_RESET();
+  highs += (digitalRead(Input_Supply_V) == HIGH);
+
+  if (highs == 4) {
+    prevPwrOn = true;
+    return true;
+  }
+  if (highs == 0) {
+    prevPwrOn = false;
+    return false;
+  }
+  return prevPwrOn;  // ambiguous zone: keep state
+}
+// -------------------------------------------------------
+void RS485_loop() {
+  uint32_t param[index_request] = {
+    METER_CURRENT_ADDRESS,
+    METER_CUMULATIVE_ADDRESS,
+    //TOTAL_ACTIVE_POWER_ADDR
+  };
+
+  for (int i = 0; i < index_request; i++) {
+    READING_PARAM(param[i]);
+    delay(50);
+
+    parameters[i] = get_param(param[i]);
+    delay(250);
+  }
+
+  Serial.println(F("========== READINGS ZM194-D9Y =========="));
+
+  DEBUG_PRINT(F("CURRENT WATER FLOW: "));
+  DEBUG_PRINT_F(parameters[0], 3);
+  DEBUG_PRINTLN();
+  DEBUG_PRINT(F("CUMULATIVE WATER FLOW: "));
+  DEBUG_PRINT_F(parameters[1], 1);
+
+
+  Serial.println(F("=========================================\n"));
+}
+
+//---------------------------------------------------------------------
+// Send petition to Modbus
+//---------------------------------------------------------------------
+void READING_PARAM(uint32_t PARAM) {
+  messege[0] = MODBUS_REQ.address;
+  messege[1] = MODBUS_REQ.function;
+  messege[2] = (MODBUS_REQ.startByte_H & PARAM) >> 24;
+  messege[3] = (MODBUS_REQ.startByte_L & PARAM) >> 16;
+  messege[4] = (MODBUS_REQ.endByte_H & PARAM) >> 8;
+  messege[5] = (MODBUS_REQ.endByte_L & PARAM);
+
+  uint16_t crc = RTU_Vcrc(messege, 6);
+  messege[6] = crc >> 8;
+  messege[7] = crc;
+
+  RS485.write(messege, 8);
+  RS485.flush();
+  delayMicroseconds(800);
+
+  DEBUG_PRINT(F("TX: "));
+  for (int i = 0; i < 8; i++) {
+    Serial.print(messege[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+
+//---------------------------------------------------------------------
+// CRC MODBUS
+//---------------------------------------------------------------------
+uint16_t RTU_Vcrc(uint8_t RTU_Buff[], uint16_t RTU_Leng) {
+  uint16_t temp = 0xFFFF, temp2, flag;
+  for (uint16_t i = 0; i < RTU_Leng; i++) {
+    temp ^= RTU_Buff[i];
+    for (uint8_t e = 1; e <= 8; e++) {
+      flag = temp & 0x0001;
+      temp >>= 1;
+      if (flag) temp ^= 0xA001;
+    }
+  }
+
+  temp2 = temp >> 8;
+  temp = (temp << 8) | temp2;
+  return temp;
+}
+
+//---------------------------------------------------------------------
+// Parse Modbus response
+//---------------------------------------------------------------------
+bool PARSING_PARAM(uint32_t data[1]) {
+  const uint8_t EXPECT = 9;            // fixed for 0x03, 2 regs
+  const uint16_t FIRST_BYTE_TO = 200;  // ms
+  const uint16_t INTER_BYTE_TO = 30;   // ms (tune 10..50)
+  uint8_t recv[EXPECT];
+  uint8_t u = 0;
+
+  // Wait for first byte
+  unsigned long t0 = millis();
+  while (!RS485.available() && (millis() - t0) < FIRST_BYTE_TO) { /* wait */
+  }
+  if (!RS485.available()) {
+    Serial.println(F("Modbus: no data (first byte timeout)."));
+    data[0] = 0;
+    return false;
+  }
+
+  // Read until EXPECT bytes, using inter-byte timeout
+  unsigned long lastByte = millis();
+  while (u < EXPECT) {
+    while (RS485.available() && u < EXPECT) {
+      recv[u++] = RS485.read();
+      lastByte = millis();
+    }
+    if ((millis() - lastByte) > INTER_BYTE_TO) break;  // frame stalled
+  }
+
+  Serial.print(F("RX("));
+  Serial.print(u);
+  Serial.print(F("): "));
+  for (int i = 0; i < u; i++) {
+    Serial.print(recv[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  if (u != EXPECT) {
+    Serial.println(F("Modbus: incomplete frame."));
+    data[0] = 0;
+    return false;
+  }
+
+  // CRC check (note: your RTU_Vcrc swaps bytes at end, so compare same way)
+  uint16_t crcCalc = RTU_Vcrc(recv, EXPECT - 2);
+  uint16_t crcResp = ((uint16_t)recv[EXPECT - 2] << 8) | recv[EXPECT - 1];
+  if (crcCalc != crcResp) {
+    Serial.println(F("Modbus: CRC error."));
+    data[0] = 0;
+    return false;
+  }
+
+  // Basic sanity
+  if (recv[0] != MODBUS_REQ.address || recv[1] != MODBUS_REQ.function || recv[2] != 4) {
+    Serial.println(F("Modbus: unexpected header."));
+    data[0] = 0;
+    return false;
+  }
+
+  uint32_t raw =
+    ((uint32_t)recv[3] << 24) | ((uint32_t)recv[4] << 16) | ((uint32_t)recv[5] << 8) | ((uint32_t)recv[6]);
+
+  data[0] = raw;
+  return true;
+}
+
+
+//---------------------------------------------------------------------
+// Escalate value
+//---------------------------------------------------------------------
+float get_param(uint32_t regAddr) {
+  uint32_t raw[1];
+
+  if (!PARSING_PARAM(raw)) {
+    return 0.0f;
+  }
+
+  float value = 0.0f;
+
+  switch (regAddr) {
+
+    case METER_CURRENT_ADDRESS:
+      value = raw[0] / 1000.0f;  // Current scaled
+      DEBUG_PRINT(F("[CURRENT] RAW="));
+      DEBUG_PRINT(raw[0]);
+      DEBUG_PRINT(F("  SCALED="));
+      DEBUG_PRINT_F(value, 3);
+      DEBUG_PRINTLN("");
+      break;
+
+    case METER_CUMULATIVE_ADDRESS:
+      value = (float)raw[0];  // Cumulative stays raw
+      DEBUG_PRINT(F("[CUMULATIVE] RAW="));
+      DEBUG_PRINTLN(raw[0]);
+      break;
+
+    default:
+      value = (float)raw[0];
+      DEBUG_PRINT(F("[UNKNOWN REG] RAW="));
+      DEBUG_PRINTLN(raw[0]);
+      break;
+  }
+
+  return value;
 }
