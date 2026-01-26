@@ -23,24 +23,21 @@
 enum ModemState {
   MODEM_OFF = 0,
   MODEM_INITIALIZING,
-  MODEM_RESET,
-  MODEM_READY,
-  MODEM_CHECK_SIM,
-  MODEM_GPRS_CONNECTING_SET_BAUD,
-  MODEM_GPRS_CONNECTING_SET_MODE,
-  MODEM_GPRS_CONNECTING_WAIT_MODE,
-  MODEM_GPRS_CONNECTING_CHECK_SIGNAL,
-  MODEM_GPRS_CONNECTING_ATTACH,
-  MODEM_GPRS_CONNECTED,
-  MODEM_GPRS_WAIT_CONNECTION,
-  MODEM_GPRS_IP_CHECK,
-  MODEM_QUERY_NETWORK_INFO,  // Query network info async
-  MODEM_SYNC_NTP_TIME,       // Sync NTP time after GPRS connected
-  MODEM_MQTT_CONNECTING_HANDSHAKE,
-  MODEM_MQTT_CONNECTING,
-  MODEM_MQTT_CONNECTED_FIRST,
-  MODEM_GPRS_CONNECTING_PDP_CONTEXT,
-  MODEM_MQTT_CONNECTED,
+  MODEM_POWER_ON,                    // Bật nguồn
+  MODEM_ACTIVATE_CNACT_FIRST,         // Kích hoạt CNACT=1,1 lần đầu
+  MODEM_WAIT_FOR_IP_FIRST,            // Đợi 10s sau khi kích hoạt CNACT lần đầu
+  MODEM_CHECK_IP_FIRST,               // Kiểm tra IP lần đầu
+  MODEM_APPLY_BOOT_CONFIG,            // Áp dụng boot config (nếu IP check fail)
+  MODEM_CHECK_SIM_AFTER_CONFIG,       // Kiểm tra SIM sau config
+  MODEM_CHECK_SIGNAL_AFTER_CONFIG,     // Kiểm tra tín hiệu sau config
+  MODEM_SET_APN,                      // Set APN
+  MODEM_WAIT_FOR_IP_AFTER_APN,        // Đợi 10s sau khi set APN
+  MODEM_CHECK_IP_AFTER_APN,           // Kiểm tra IP sau khi set APN
+  MODEM_SYNC_NTP_TIME,                // Sync NTP time after GPRS connected
+  MODEM_MQTT_CONNECTING_HANDSHAKE,     // Cấu hình MQTT
+  MODEM_MQTT_CONNECTING,               // Kết nối MQTT
+  MODEM_MQTT_CONNECTED_FIRST,         // MQTT connected lần đầu
+  MODEM_MQTT_CONNECTED,               // MQTT connected
   MODEM_ERROR
 };
 
