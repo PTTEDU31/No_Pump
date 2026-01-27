@@ -28,6 +28,7 @@ extern const char* CRYPTOKEY;
 
 #define RS485_RX_PIN 5  // PIN RX for RS485 module
 #define RS485_TX_PIN 6  // PIN TX for RS485 module
+#define TIME_ZONE_OFFSET_HOURS 7  // Timezone offset from UTC in hours
 
 // =========================================================================
 // MODBUS ADDRESSES

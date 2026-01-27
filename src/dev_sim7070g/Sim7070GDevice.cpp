@@ -97,7 +97,7 @@ int Sim7070GDevice::start()
   DEBUG_PRINTLN(F("[SIM7070G] Starting modem..."));
 
   // MQTT topics
-  snprintf(_pubTopic, sizeof(_pubTopic), "nono/%s/pub", _nodeId);
+  snprintf(_pubTopic, sizeof(_pubTopic), "nono/%s/sub", _nodeId);
   snprintf(_subTopic, sizeof(_subTopic), "nono/%s/sub", _nodeId);
 
   // MQTT credentials
@@ -324,6 +324,18 @@ int Sim7070GDevice::timeout()
       updateState(MODEM_POWER_ON);
       return 200;
     }
+    char ip[16];
+    if (_modem->getIPAddress(ip, sizeof(ip)))
+    {
+      DEBUG_PRINTLN(F("[SIM7070G] IP đã được cấp trước đó, bỏ qua CNACT..."));
+      DEBUG_PRINT(F("[SIM7070G] IP: "));
+      DEBUG_PRINTLN(ip);
+      updateState(MODEM_SYNC_NTP_TIME);
+      _retryCount = 0;
+      return 500;
+    }
+   
+
     DEBUG_PRINTLN(F("[SIM7070G] Khởi tạo kết nối AT+CNACT=1,1..."));
     if (_modem->checkSendCommandSync("AT+CNACT=0,1", "OK", 10000)) {
       DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 thành công"));
@@ -525,7 +537,7 @@ int Sim7070GDevice::timeout()
     DEBUG_PRINTLN(F("[SIM7070G] Synchronizing NTP time..."));
     
     // Try to sync NTP time with multiple servers
-    bool ntpSuccess = _modem->syncTimeUTC_any(32, 12000);
+    bool ntpSuccess = _modem->syncTimeUTC_any(28, 12000);
     
     if (ntpSuccess)
     {
@@ -603,11 +615,19 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    
-    if (_modem->checkSendCommandSync("AT+SMCONN", "OK", 120000))
+    if(_modem->isMQTTConnected())
     {
+      DEBUG_PRINTLN(F("[SIM7070G] MQTT already connected"));
+      _retryCount = 0; // Reset retry count khi vào MODEM_MQTT_CONNECTED_FIRST
       updateState(MODEM_MQTT_CONNECTED_FIRST);
-      return DURATION_IMMEDIATELY;
+      return 10000;
+    }
+    
+    if (_modem->sendCommand("AT+SMCONN", 300000,))
+    {
+      _retryCount = 0; // Reset retry count khi vào MODEM_MQTT_CONNECTED_FIRST
+      updateState(MODEM_MQTT_CONNECTED_FIRST);
+      return 10000;
     }
     else
     {
@@ -623,17 +643,51 @@ int Sim7070GDevice::timeout()
       _modem->loop();
       
       // Subscribe to topic
-      _modem->mqttSubscribe(_subTopic, 1);
-
-      // Publish online status
-      char msg[160];
-      snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
-      _modem->mqttPublish(_pubTopic, msg, 1, false);
+      if(_modem->mqttSubscribe(_subTopic, 1))
+      {
+        DEBUG_PRINTLN(F("[SIM7070G] Subscribed to MQTT topic successfully"));
+        // Thành công, reset retry count
+        _retryCount = 0;
+        
+        // Publish online status
+        char msg[160];
+        snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
+        _modem->mqttPublish(_pubTopic, msg, 1, false);
+        
+        _lastHeartbeatMs = millis();
+        updateState(MODEM_MQTT_CONNECTED);
+        return 200;
+      }
+      else
+      {
+        _retryCount++;
+        DEBUG_PRINT(F("[SIM7070G] Failed to subscribe to MQTT topic (lần "));
+        DEBUG_PRINT(_retryCount);
+        DEBUG_PRINTLN(F(")"));
+        
+        if (_retryCount >= 5) {
+          DEBUG_PRINTLN(F("[SIM7070G] Subscribe thất bại quá 5 lần, đóng và khởi tạo lại MQTT..."));
+          // Đóng kết nối MQTT
+          if (_modem->isMQTTConnected()) {
+            _modem->mqttDisconnect();
+            DEBUG_PRINTLN(F("[SIM7070G] Đã đóng kết nối MQTT"));
+          }
+          // Reset MQTT để khởi tạo lại
+          _mqttBegun = false;
+          _retryCount = 0;
+          // Khởi tạo lại MQTT
+          updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
+          return DURATION_IMMEDIATELY;
+        } else {
+          // Retry subscribe sau 10 giây
+          return 10000;
+        }
+      }
     }
-
-    _lastHeartbeatMs = millis();
-    updateState(MODEM_MQTT_CONNECTED);
-    return 200;
+    
+    // Nếu _modem null, chuyển về error
+    updateState(MODEM_ERROR);
+    return 10000;
   }
 
   case MODEM_MQTT_CONNECTED:

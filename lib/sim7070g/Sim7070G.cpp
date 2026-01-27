@@ -407,27 +407,6 @@ bool Sim7070G::attacthService()
   DEBUG_PRINT(F("[PDP] Signal quality: "));
   DEBUG_PRINTLN(rssi);
 
-  // Step 3: Check PS service - AT+CGATT?
-  // DEBUG_PRINTLN(F("[PDP] Step 3: Checking PS service attachment..."));
-  // if (!_at.sendCommandSync("AT+CGATT?", 5000, response, sizeof(response))) {
-  //   DEBUG_PRINTLN(F("[PDP] Failed to check PS service"));
-  //   return false;
-  // }
-  // // Parse +CGATT: <state> (1 indicates PS has attached)
-  // int cgattState = 0;
-  // if (sscanf(response, "+CGATT: %d", &cgattState) == 1) {
-  //   if (cgattState != 1) {
-  //     DEBUG_PRINT(F("[PDP] PS service not attached (state="));
-  //     DEBUG_PRINT(cgattState);
-  //     DEBUG_PRINTLN(F(")"));
-  //     return false;
-  //   }
-  //   DEBUG_PRINTLN(F("[PDP] PS service is attached"));
-  // } else {
-  //   DEBUG_PRINTLN(F("[PDP] Failed to parse CGATT response"));
-  //   return false;
-  // }
-  // step3: activate application network
   sendCommand("AT+CGDCONT?", 1000);
   if (!checkSendCommandSync("AT+CNACT=1,1", "OK", 5000))
   {
@@ -593,7 +572,7 @@ bool Sim7070G::deactivatePDPContext(uint8_t cid)
 bool Sim7070G::getIPAddress(char *ip, size_t len)
 {
   char response[128];
-  if (!_at.sendCommandSync("AT+CNACT?", 15000, response, sizeof(response)))
+  if (!_at.sendCommandSync("AT+CNACT?", 2000, response, sizeof(response)))
   {
     return false;
   }
@@ -640,7 +619,7 @@ bool Sim7070G::getIPAddress(char *ip, size_t len)
     }
   }
 
-  return true;
+  return false;
 }
 
 NetworkInfo Sim7070G::getNetworkInfo()
@@ -795,7 +774,7 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
   // Then send payload
   char cmd[256];
   size_t payloadLen = strlen(payload);
-  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, qos, retain ? 1 : 0, payloadLen);
+  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic,payloadLen, qos, retain ? 1 : 0);
 
   if (!_at.sendCommandSync(cmd, 5000))
   {
@@ -892,19 +871,12 @@ bool Sim7070G::mqttGetState(MQTTState *state)
 
 bool Sim7070G::isMQTTConnected()
 {
-  char response[64];
-  if (!_at.sendCommandSync("AT+SMSTATE?", 5000, response, sizeof(response)))
+  if (checkSendCommandSync("AT+SMSTATE?", "+SMSTATE: 0", 1000))
   {
     return false;
   }
 
-  int state;
-  if (sscanf(response, "+SMSTATE: %d", &state) == 1)
-  {
-    return (state == 1);
-  }
-
-  return false;
+  return true;
 }
 
 // HTTP Client Implementation
