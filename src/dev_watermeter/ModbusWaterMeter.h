@@ -14,7 +14,8 @@
 // Address 4114 (0x1012) = Instantaneous flow rate (m³/s) - Float Inverse format
 // Address 4112 (0x1010) = Instantaneous flow (m³) - Float Inverse format  
 // Address 4120 (0x1018) = Positive cumulative integer part - Long Inverse format
-#define METER_CURRENT_ADDRESS 0x00001012  // 4114 decimal - Instantaneous flow rate
+#define METER_FLOW_UNIT_ADDRESS 0x0006     // Flow unit (0-8): 0=none, 1=m³/s, 2=m³/min, 3=m³/h, 4=m³/d, 5=m³/h, 6=L/s, 7=L/min, 8=L/h
+#define METER_FLOW_RATE_ADDRESS 0x0005     // Flow rate (in unit specified by flow unit register)
 #define METER_CUMULATIVE_ADDRESS 0x00001018  // 4120 decimal - Positive cumulative integer part
 
 // History storage configuration
@@ -104,15 +105,19 @@ private:
   // Last read timestamp
   unsigned long _lastReadTime;
   
-  // Reading state: 0 = read current flow, 1 = read cumulative flow
+  // Reading state: 0 = read flow unit, 1 = read flow rate, 2 = read cumulative flow
   uint8_t _readingState;
+  uint8_t _flowUnit;  // Flow unit (0-8) from register 0x0006
   
   // Internal methods
   bool readParameter(uint32_t regAddr, float& value);
-  void sendModbusRequest(uint32_t regAddr);
+  bool readUint16Parameter(uint32_t regAddr, uint16_t& value);
+  void sendModbusRequest(uint32_t regAddr, uint16_t numRegisters = METER_NUM_REGISTERS);
   bool parseModbusResponse(float& floatValue, bool isFloatInverse);
+  bool parseModbusResponseUint16(uint16_t& value);
   uint16_t calculateCRC(uint8_t* buffer, uint16_t length);
   float parseFloatInverse(uint8_t* data);  // Parse IEEE754 float with inverse byte order
+  float convertToM3PerSecond(float value, uint8_t flowUnit);  // Convert to m³/s based on flow unit
   void addToHistory(const WaterMeterReading& reading);
   
   // Modbus frame buffer

@@ -13,7 +13,8 @@ ModbusWaterMeter::ModbusWaterMeter(Uart* rs485Serial, uint32_t readIntervalMs)
     _totalValidReadings(0),
     _totalFailedReadings(0),
     _lastReadTime(0),
-    _readingState(0) {
+    _readingState(0),
+    _flowUnit(1) {  // Default to m³/s
   
   // Initialize latest reading
   _latestReading.timestamp = 0;
@@ -52,7 +53,8 @@ bool ModbusWaterMeter::initialize() {
 int ModbusWaterMeter::start() {
   DEBUG_PRINTLN(F("[MODBUS] Water meter started"));
   _lastReadTime = millis();
-  _readingState = 0;  // Start with current flow
+  _readingState = 0;  // Start with flow unit
+  _flowUnit = 1;  // Default to m³/s if not read yet
   
   // Return immediately to start first reading
   return DURATION_IMMEDIATELY;
@@ -61,25 +63,45 @@ int ModbusWaterMeter::start() {
 // Timeout - Called when timeout expires, returns new duration
 int ModbusWaterMeter::timeout() {
   if (_readingState == 0) {
-    // Step 1: Read current flow
-    DEBUG_PRINTLN(F("[MODBUS] Reading current flow..."));
+    // Step 1: Read flow unit
+    DEBUG_PRINTLN(F("[MODBUS] Reading flow unit..."));
     
-    float currentFlow = 0.0f;
-    if (readParameter(METER_CURRENT_ADDRESS, currentFlow)) {
-      _latestReading.currentFlow = currentFlow;
-      _latestReading.timestamp = millis();
-      DEBUG_PRINT(F("[MODBUS] Current flow: "));
-      DEBUG_PRINT(currentFlow);
-      DEBUG_PRINTLN(F(" m³/s"));
+    uint16_t flowUnit = 1;  // Default to m³/s
+    if (readUint16Parameter(METER_FLOW_UNIT_ADDRESS, flowUnit)) {
+      _flowUnit = (uint8_t)flowUnit;
+      if (_flowUnit > 8) _flowUnit = 1;  // Sanity check
+      DEBUG_PRINT(F("[MODBUS] Flow unit: "));
+      DEBUG_PRINTLN(_flowUnit);
     } else {
-      DEBUG_PRINTLN(F("[MODBUS] Failed to read current flow"));
+      DEBUG_PRINTLN(F("[MODBUS] Failed to read flow unit, using default (m³/s)"));
     }
     
-    _readingState = 1;  // Next: read cumulative
+    _readingState = 1;  // Next: read flow rate
+    return 50;  // Wait 50ms before reading flow rate
+    
+  } else if (_readingState == 1) {
+    // Step 2: Read flow rate and convert to m³/s
+    DEBUG_PRINTLN(F("[MODBUS] Reading flow rate..."));
+    
+    float flowRate = 0.0f;
+    if (readParameter(METER_FLOW_RATE_ADDRESS, flowRate)) {
+      // Convert to m³/s based on flow unit
+      _latestReading.currentFlow = convertToM3PerSecond(flowRate, _flowUnit);
+      _latestReading.timestamp = millis();
+      DEBUG_PRINT(F("[MODBUS] Flow rate (raw): "));
+      DEBUG_PRINT(flowRate);
+      DEBUG_PRINT(F(" | Converted: "));
+      DEBUG_PRINT(_latestReading.currentFlow);
+      DEBUG_PRINTLN(F(" m³/s"));
+    } else {
+      DEBUG_PRINTLN(F("[MODBUS] Failed to read flow rate"));
+    }
+    
+    _readingState = 2;  // Next: read cumulative
     return 50;  // Wait 50ms before reading cumulative
     
   } else {
-    // Step 2: Read cumulative flow
+    // Step 3: Read cumulative flow
     DEBUG_PRINTLN(F("[MODBUS] Reading cumulative flow..."));
     
     float cumulativeFlow = 0.0f;
@@ -102,8 +124,8 @@ int ModbusWaterMeter::timeout() {
     // Store reading in history
     addToHistory(_latestReading);
     
-    _readingState = 0;  // Next cycle: start with current flow again
-    return _readIntervalMs;  // Wait 5 seconds before next reading cycle
+    _readingState = 0;  // Next cycle: start with flow unit again
+    return _readIntervalMs;  // Wait before next reading cycle
   }
 }
 
@@ -118,8 +140,17 @@ bool ModbusWaterMeter::readAllParameters() {
   newReading.timestamp = millis();
   newReading.valid = true;
   
-  // Read current flow
-  if (!readParameter(METER_CURRENT_ADDRESS, newReading.currentFlow)) {
+  // Read flow unit first
+  uint16_t flowUnit = 1;
+  readUint16Parameter(METER_FLOW_UNIT_ADDRESS, flowUnit);
+  uint8_t unit = (uint8_t)flowUnit;
+  if (unit > 8) unit = 1;
+  
+  // Read flow rate and convert to m³/s
+  float flowRate = 0.0f;
+  if (readParameter(METER_FLOW_RATE_ADDRESS, flowRate)) {
+    newReading.currentFlow = convertToM3PerSecond(flowRate, unit);
+  } else {
     newReading.currentFlow = 0.0f;
     newReading.valid = false;
   }
@@ -146,14 +177,14 @@ bool ModbusWaterMeter::readAllParameters() {
   return newReading.valid;
 }
 
-// Read a single parameter
+// Read a single parameter (float)
 bool ModbusWaterMeter::readParameter(uint32_t regAddr, float& value) {
   // Send request
   sendModbusRequest(regAddr);
   delay(50);
   
   // Parse response - all variable data uses Float Inverse format
-  bool isFloatInverse = (regAddr == METER_CURRENT_ADDRESS);
+  bool isFloatInverse = true;  // All float parameters use inverse format
   if (!parseModbusResponse(value, isFloatInverse)) {
     Serial.println(F("[MODBUS] Failed to parse response"));
     return false;
@@ -162,8 +193,23 @@ bool ModbusWaterMeter::readParameter(uint32_t regAddr, float& value) {
   return true;
 }
 
+// Read a single parameter (uint16_t)
+bool ModbusWaterMeter::readUint16Parameter(uint32_t regAddr, uint16_t& value) {
+  // Send request for 1 register (2 bytes)
+  sendModbusRequest(regAddr, 1);
+  delay(50);
+  
+  // Parse response as uint16_t
+  if (!parseModbusResponseUint16(value)) {
+    Serial.println(F("[MODBUS] Failed to parse uint16 response"));
+    return false;
+  }
+  
+  return true;
+}
+
 // Send Modbus request
-void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr) {
+void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr, uint16_t numRegisters) {
   // Extract register address (16-bit)
   uint16_t startReg = regAddr & 0xFFFF;
   
@@ -172,8 +218,8 @@ void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr) {
   _txBuffer[1] = METER_FUNCTION_CODE;  // 0x04 for Read Input Registers
   _txBuffer[2] = (startReg >> 8) & 0xFF;   // Register high byte
   _txBuffer[3] = startReg & 0xFF;          // Register low byte
-  _txBuffer[4] = (METER_NUM_REGISTERS >> 8) & 0xFF;  // Num registers high
-  _txBuffer[5] = METER_NUM_REGISTERS & 0xFF;         // Num registers low (2 registers = 4 bytes)
+  _txBuffer[4] = (numRegisters >> 8) & 0xFF;  // Num registers high
+  _txBuffer[5] = numRegisters & 0xFF;         // Num registers low
   
   // Calculate CRC
   uint16_t crc = calculateCRC(_txBuffer, 6);
@@ -195,7 +241,7 @@ void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr) {
   Serial.println();
 }
 
-// Parse Modbus response
+// Parse Modbus response (float)
 bool ModbusWaterMeter::parseModbusResponse(float& floatValue, bool isFloatInverse) {
   const uint8_t EXPECT_BYTES = 9;  // Address(1) + Function(1) + Length(1) + Data(4) + CRC(2)
   const uint16_t FIRST_BYTE_TIMEOUT = 200;  // ms
@@ -275,6 +321,81 @@ bool ModbusWaterMeter::parseModbusResponse(float& floatValue, bool isFloatInvers
   return true;
 }
 
+// Parse Modbus response (uint16_t)
+bool ModbusWaterMeter::parseModbusResponseUint16(uint16_t& value) {
+  const uint8_t EXPECT_BYTES = 7;  // Address(1) + Function(1) + Length(1) + Data(2) + CRC(2)
+  const uint16_t FIRST_BYTE_TIMEOUT = 200;  // ms
+  const uint16_t INTER_BYTE_TIMEOUT = 30;   // ms
+  
+  uint8_t bytesReceived = 0;
+  
+  // Wait for first byte
+  unsigned long t0 = millis();
+  while (!_rs485->available() && (millis() - t0) < FIRST_BYTE_TIMEOUT) {
+    // Wait
+  }
+  
+  if (!_rs485->available()) {
+    Serial.println(F("[MODBUS] Timeout waiting for first byte (uint16)"));
+    return false;
+  }
+  
+  // Read bytes with inter-byte timeout
+  unsigned long lastByteTime = millis();
+  while (bytesReceived < EXPECT_BYTES) {
+    while (_rs485->available() && bytesReceived < EXPECT_BYTES) {
+      _rxBuffer[bytesReceived++] = _rs485->read();
+      lastByteTime = millis();
+    }
+    
+    if ((millis() - lastByteTime) > INTER_BYTE_TIMEOUT) {
+      break;  // Frame stalled
+    }
+  }
+  
+  // Debug print
+  Serial.print(F("[MODBUS] RX(uint16)("));
+  Serial.print(bytesReceived);
+  Serial.print(F("): "));
+  for (int i = 0; i < bytesReceived; i++) {
+    if (_rxBuffer[i] < 0x10) Serial.print('0');
+    Serial.print(_rxBuffer[i], HEX);
+    Serial.print(' ');
+  }
+  Serial.println();
+  
+  // Verify frame length
+  if (bytesReceived != EXPECT_BYTES) {
+    Serial.println(F("[MODBUS] Incomplete frame (uint16)"));
+    return false;
+  }
+  
+  // Verify CRC
+  uint16_t crcCalc = calculateCRC(_rxBuffer, EXPECT_BYTES - 2);
+  uint16_t crcResp = ((uint16_t)_rxBuffer[EXPECT_BYTES - 1] << 8) | _rxBuffer[EXPECT_BYTES - 2];
+  
+  if (crcCalc != crcResp) {
+    Serial.print(F("[MODBUS] CRC error (uint16) - Calc: "));
+    Serial.print(crcCalc, HEX);
+    Serial.print(F(" Resp: "));
+    Serial.println(crcResp, HEX);
+    return false;
+  }
+  
+  // Verify header
+  if (_rxBuffer[0] != METER_ADDRESS || 
+      _rxBuffer[1] != METER_FUNCTION_CODE || 
+      _rxBuffer[2] != 2) {  // 2 bytes for uint16_t
+    Serial.println(F("[MODBUS] Invalid header (uint16)"));
+    return false;
+  }
+  
+  // Parse uint16_t from bytes 3-4 (high byte first, then low byte)
+  value = ((uint16_t)_rxBuffer[3] << 8) | _rxBuffer[4];
+  
+  return true;
+}
+
 // Calculate Modbus CRC-16
 uint16_t ModbusWaterMeter::calculateCRC(uint8_t* buffer, uint16_t length) {
   uint16_t crc = 0xFFFF;
@@ -313,6 +434,34 @@ float ModbusWaterMeter::parseFloatInverse(uint8_t* data) {
                   ((uint32_t)data[0]);
   
   return converter.f32;
+}
+
+// Convert flow rate to m³/s based on flow unit
+// Flow unit: 0=none, 1=m³/s, 2=m³/min, 3=m³/h, 4=m³/d, 5=m³/h, 6=L/s, 7=L/min, 8=L/h
+float ModbusWaterMeter::convertToM3PerSecond(float value, uint8_t flowUnit) {
+  switch (flowUnit) {
+    case 0:  // none - return as is (assume already in m³/s)
+      return value;
+    case 1:  // m³/s - no conversion
+      return value;
+    case 2:  // m³/min - divide by 60
+      return value / 60.0f;
+    case 3:  // m³/h - divide by 3600
+      return value / 3600.0f;
+    case 4:  // m³/d - divide by 86400
+      return value / 86400.0f;
+    case 5:  // m³/h (confirm) - divide by 3600
+      return value / 3600.0f;
+    case 6:  // L/s - divide by 1000
+      return value / 1000.0f;
+    case 7:  // L/min - divide by 60000
+      return value / 60000.0f;
+    case 8:  // L/h - divide by 3600000
+      return value / 3600000.0f;
+    default:
+      // Unknown unit, return as is
+      return value;
+  }
 }
 
 
