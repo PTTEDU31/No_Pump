@@ -70,7 +70,7 @@ int ModbusWaterMeter::timeout() {
       _latestReading.timestamp = millis();
       DEBUG_PRINT(F("[MODBUS] Current flow: "));
       DEBUG_PRINT(currentFlow);
-      DEBUG_PRINTLN(F(" m³/h"));
+      DEBUG_PRINTLN(F(" m³/s"));
     } else {
       DEBUG_PRINTLN(F("[MODBUS] Failed to read current flow"));
     }
@@ -152,36 +152,33 @@ bool ModbusWaterMeter::readParameter(uint32_t regAddr, float& value) {
   sendModbusRequest(regAddr);
   delay(50);
   
-  // Parse response
-  uint32_t rawValue = 0;
-  if (!parseModbusResponse(rawValue)) {
+  // Parse response - all variable data uses Float Inverse format
+  bool isFloatInverse = (regAddr == METER_CURRENT_ADDRESS);
+  if (!parseModbusResponse(value, isFloatInverse)) {
     Serial.println(F("[MODBUS] Failed to parse response"));
     return false;
   }
-  
-  // Scale value
-  value = scaleValue(rawValue, regAddr);
   
   return true;
 }
 
 // Send Modbus request
 void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr) {
-  // Extract register address from 32-bit format
-  uint16_t startReg = (regAddr >> 16) & 0xFFFF;
+  // Extract register address (16-bit)
+  uint16_t startReg = regAddr & 0xFFFF;
   
   // Build request frame
   _txBuffer[0] = METER_ADDRESS;
-  _txBuffer[1] = METER_FUNCTION_CODE;
+  _txBuffer[1] = METER_FUNCTION_CODE;  // 0x04 for Read Input Registers
   _txBuffer[2] = (startReg >> 8) & 0xFF;   // Register high byte
   _txBuffer[3] = startReg & 0xFF;          // Register low byte
   _txBuffer[4] = (METER_NUM_REGISTERS >> 8) & 0xFF;  // Num registers high
-  _txBuffer[5] = METER_NUM_REGISTERS & 0xFF;         // Num registers low
+  _txBuffer[5] = METER_NUM_REGISTERS & 0xFF;         // Num registers low (2 registers = 4 bytes)
   
   // Calculate CRC
   uint16_t crc = calculateCRC(_txBuffer, 6);
-  _txBuffer[6] = crc >> 8;    // CRC high byte
-  _txBuffer[7] = crc & 0xFF;  // CRC low byte
+  _txBuffer[6] = crc & 0xFF;   // CRC low byte
+  _txBuffer[7] = crc >> 8;     // CRC high byte
   
   // Send request
   _rs485->write(_txBuffer, 8);
@@ -199,8 +196,8 @@ void ModbusWaterMeter::sendModbusRequest(uint32_t regAddr) {
 }
 
 // Parse Modbus response
-bool ModbusWaterMeter::parseModbusResponse(uint32_t& rawValue) {
-  const uint8_t EXPECT_BYTES = 9;
+bool ModbusWaterMeter::parseModbusResponse(float& floatValue, bool isFloatInverse) {
+  const uint8_t EXPECT_BYTES = 9;  // Address(1) + Function(1) + Length(1) + Data(4) + CRC(2)
   const uint16_t FIRST_BYTE_TIMEOUT = 200;  // ms
   const uint16_t INTER_BYTE_TIMEOUT = 30;   // ms
   
@@ -247,12 +244,15 @@ bool ModbusWaterMeter::parseModbusResponse(uint32_t& rawValue) {
     return false;
   }
   
-  // Verify CRC
+  // Verify CRC (Modbus RTU: CRC low byte first, then high byte)
   uint16_t crcCalc = calculateCRC(_rxBuffer, EXPECT_BYTES - 2);
-  uint16_t crcResp = ((uint16_t)_rxBuffer[EXPECT_BYTES - 2] << 8) | _rxBuffer[EXPECT_BYTES - 1];
+  uint16_t crcResp = ((uint16_t)_rxBuffer[EXPECT_BYTES - 1] << 8) | _rxBuffer[EXPECT_BYTES - 2];
   
   if (crcCalc != crcResp) {
-    Serial.println(F("[MODBUS] CRC error"));
+    Serial.print(F("[MODBUS] CRC error - Calc: "));
+    Serial.print(crcCalc, HEX);
+    Serial.print(F(" Resp: "));
+    Serial.println(crcResp, HEX);
     return false;
   }
   
@@ -264,11 +264,13 @@ bool ModbusWaterMeter::parseModbusResponse(uint32_t& rawValue) {
     return false;
   }
   
-  // Extract 4-byte data (big-endian)
-  rawValue = ((uint32_t)_rxBuffer[3] << 24) |
-             ((uint32_t)_rxBuffer[4] << 16) |
-             ((uint32_t)_rxBuffer[5] << 8) |
-             ((uint32_t)_rxBuffer[6]);
+  // Parse float value from bytes 3-6 (Float Inverse format: byte order is reversed)
+  if (isFloatInverse) {
+    floatValue = parseFloatInverse(&_rxBuffer[3]);
+  } else {
+    // For cumulative, also use float inverse format
+    floatValue = parseFloatInverse(&_rxBuffer[3]);
+  }
   
   return true;
 }
@@ -290,25 +292,29 @@ uint16_t ModbusWaterMeter::calculateCRC(uint8_t* buffer, uint16_t length) {
     }
   }
   
-  // Swap bytes (Modbus convention)
-  return ((crc >> 8) | (crc << 8));
+  return crc;  // CRC is already in correct byte order for Modbus RTU
 }
 
-// Scale raw value based on register type
-float ModbusWaterMeter::scaleValue(uint32_t rawValue, uint32_t regAddr) {
-  switch (regAddr) {
-    case METER_CURRENT_ADDRESS:
-      // Current flow: divide by 1000 to get m³/h
-      return rawValue / 1000.0f;
-      
-    case METER_CUMULATIVE_ADDRESS:
-      // Cumulative: no scaling, return as m³
-      return (float)rawValue;
-      
-    default:
-      return (float)rawValue;
-  }
+// Parse IEEE754 float from Float Inverse format (byte order reversed)
+// According to L-MAG-BM protocol: bytes are in order [byte4, byte3, byte2, byte1]
+// We need to reverse them to [byte1, byte2, byte3, byte4] for IEEE754
+float ModbusWaterMeter::parseFloatInverse(uint8_t* data) {
+  // Float Inverse format: data[0]=byte4, data[1]=byte3, data[2]=byte2, data[3]=byte1
+  // We need to reverse to: byte1, byte2, byte3, byte4 for IEEE754
+  union {
+    uint32_t u32;
+    float f32;
+  } converter;
+  
+  // Reverse byte order: [byte4, byte3, byte2, byte1] -> [byte1, byte2, byte3, byte4]
+  converter.u32 = ((uint32_t)data[3] << 24) |
+                  ((uint32_t)data[2] << 16) |
+                  ((uint32_t)data[1] << 8) |
+                  ((uint32_t)data[0]);
+  
+  return converter.f32;
 }
+
 
 // Add reading to circular history buffer
 void ModbusWaterMeter::addToHistory(const WaterMeterReading& reading) {
@@ -404,8 +410,8 @@ void ModbusWaterMeter::printLastReading() const {
   Serial.println(F(" ms"));
   
   Serial.print(F("Current Flow: "));
-  Serial.print(_latestReading.currentFlow, 3);
-  Serial.println(F(" m³/h"));
+  Serial.print(_latestReading.currentFlow, 6);
+  Serial.println(F(" m³/s"));
   
   Serial.print(F("Cumulative Flow: "));
   Serial.print(_latestReading.cumulativeFlow, 1);
@@ -435,16 +441,16 @@ void ModbusWaterMeter::printStatistics() const {
   
   if (stats.validReadings > 0) {
     Serial.print(F("Current Flow - Min: "));
-    Serial.print(stats.currentFlowMin, 3);
-    Serial.println(F(" m³/h"));
+    Serial.print(stats.currentFlowMin, 6);
+    Serial.println(F(" m³/s"));
     
     Serial.print(F("Current Flow - Max: "));
-    Serial.print(stats.currentFlowMax, 3);
-    Serial.println(F(" m³/h"));
+    Serial.print(stats.currentFlowMax, 6);
+    Serial.println(F(" m³/s"));
     
     Serial.print(F("Current Flow - Avg: "));
-    Serial.print(stats.currentFlowAvg, 3);
-    Serial.println(F(" m³/h"));
+    Serial.print(stats.currentFlowAvg, 6);
+    Serial.println(F(" m³/s"));
     
     Serial.print(F("Cumulative - Start: "));
     Serial.print(stats.cumulativeFlowStart, 1);

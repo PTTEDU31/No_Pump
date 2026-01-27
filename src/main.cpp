@@ -9,18 +9,19 @@
 #include "device.h"
 #include "DEBUG.h"
 #include "dev_sim7070g/Sim7070GDevice.h"
+#include "dev_pump/PumpDevice.h"
 
 ///////////////////////////////////////////////////////////////////////////
 // CREDENTIALS - Change these values from the portal
 ///////////////////////////////////////////////////////////////////////////
-// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-// const char* USERNAME = "node_d935168a3a77";
-// const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
+const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+const char* USERNAME = "node_d935168a3a77";
+const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
 const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
 // const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-const char* NODE_ID = "001";
-const char* USERNAME = "";
-const char* PASSWORD = "";
+// const char* NODE_ID = "001";
+// const char* USERNAME = "";
+// const char* PASSWORD = "";
 ///////////////////////////////////////////////////////////////////////////
 // MQTT SERVER
 ///////////////////////////////////////////////////////////////////////////
@@ -43,8 +44,6 @@ static inline void WDT_RESET() {
 // RUNTIME STATE VARIABLES
 ///////////////////////////////////////////////////////////////////////////
 bool prevPwrOn = false;
-byte pump = 0;
-int onPulse = ON_PULSE_MS;
 bool serverOnCommand = false;
 
 unsigned long lastRestartMs = 0;
@@ -53,12 +52,6 @@ unsigned long lastSensorRead = 0;
 
 int vibrationCount = 0;
 int EventCountTotal = 0;
-
-volatile bool protectOnStart = false;
-unsigned long protectStartMs = 0;
-unsigned long protectLastAnnounce = 0;
-volatile bool lastOffByHexFlag = false;
-bool prevPumpOn = false;
 
 ///////////////////////////////////////////////////////////////////////////
 // SENSOR DATA STRUCTURE
@@ -109,6 +102,8 @@ ModbusWaterMeter waterMeter(&RS485);
 // SIM7070G Modem Device
 Sim7070GDevice modem(&sim7070, NODE_ID);
 
+// Pump Device (control, debounce, protection)
+PumpDevice pump(CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN);
 
 // ----------------- PROTOTYPES -----------------
 void turnOnPump();
@@ -152,78 +147,6 @@ static inline bool isPwrPresent() {
   return prevPwrOn;  // ambiguous zone: keep state
 }
 
-static inline bool isPumpOn() {
-  // Read with debounce: 4 samples with 20ms delay
-  byte highs = 0;
-  highs += (digitalRead(CONTACT_PIN) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(CONTACT_PIN) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(CONTACT_PIN) == HIGH);
-  delay(20);
-  WDT_RESET();
-  highs += (digitalRead(CONTACT_PIN) == HIGH);
-  
-  // If all 4 readings are HIGH, pump is on
-  // If all 4 readings are LOW, pump is off
-  // Otherwise, keep previous state (debounce)
-  if (highs == 4) {
-    return true;
-  }
-  if (highs == 0) {
-    return false;
-  }
-  return prevPumpOn;  // ambiguous zone: keep previous state
-}
-
-static inline void armStartProtection(const char* motivo) {
-  protectOnStart = true;
-  protectStartMs = millis();
-  protectLastAnnounce = 0;
-  DEBUG_PRINT(F("[PROTECT] Started: "));
-  DEBUG_PRINTLN(motivo);
-}
-
-static inline void serviceStartProtection() {
-  if (!protectOnStart) return;
-
-  unsigned long elapsed = millis() - protectStartMs;
-
-  if (elapsed >= PROTECT_ON_MS) {
-    protectOnStart = false;
-    DEBUG_PRINTLN(F("[PROTECT] End. Protection time has passed."));
-  } else {
-    if ((millis() - protectLastAnnounce) >= PROTECT_TICK_MS) {
-      protectLastAnnounce = millis();
-      unsigned long remain = (PROTECT_ON_MS - elapsed) / 1000;
-      DEBUG_PRINT(F("[PROTECT] Active. Remain: "));
-      DEBUG_PRINT(remain);
-      DEBUG_PRINTLN(F(" s."));
-    }
-  }
-}
-
-static inline void servicePumpEdgeAndStatus() {
-  bool nowOn = isPumpOn();
-
-  // Detection of flank: ON -> OFF (turned off by contact, without HEX)
-  if (prevPumpOn && !nowOn) {
-    if (!lastOffByHexFlag) {
-      armStartProtection("Turned OFF detected by contact (without HEX)");
-    } else {
-      lastOffByHexFlag = false;
-    }
-  }
-
-  prevPumpOn = nowOn;
-
-  // X (pump): 1 on, 0 off
-  pump = nowOn ? 1 : 0;
-}
-
-
 // ========== END STATIC INLINE FUNCTIONS ==========
 
 // Mandatory ISR to manage interruptions of SERCOM0
@@ -233,20 +156,17 @@ void SERCOM0_Handler() {
 
 // Device array for DeviceManager
 Device* devices[] = {
-    // &waterMeter,
-    &modem
+    &waterMeter,
+    &modem,
+    &pump,
 };
 
 // ----------------- SETUP -----------------
 void setup() {
   // WDT_INIT();
   delay(2000);
-  pinMode(PWR_ON_PIN, OUTPUT);
-  pinMode(PWR_OFF_PIN, OUTPUT);
-  pinMode(CONTACT_PIN, INPUT);
 
   pinMode(BATT_VOLTS, INPUT);
-
   pinMode(Input_Supply_V, INPUT);
 
   // Initialize Serial for debugging
@@ -257,9 +177,12 @@ void setup() {
   DeviceManager::getInstance().registerDevices(devices, sizeof(devices) / sizeof(devices[0]));
   DEBUG_PRINTLN(F("[DEVICE] Devices registered"));
   
-  // Initialize all devices
+  // Initialize all devices (PumpDevice configures PWR_ON, PWR_OFF, CONTACT pins)
   DeviceManager::getInstance().init();
   DEBUG_PRINTLN(F("[DEVICE] Devices initialized"));
+  
+  // Latch relay safety: if pump contact says OFF, pulse OFF to reset relay state
+  latchRelaySafetySetup();
   
   // Start all devices
   DeviceManager::getInstance().start();
@@ -272,24 +195,6 @@ void loop() {
   
   // Update all devices via DeviceManager (handles timeout callbacks)
   DeviceManager::getInstance().update(millis());
-  
-  // // Read sensors periodically (every 1 second)
-  // if ((long)(millis() - lastSensorRead) >= 1000L) {
-  //   lastSensorRead = millis();
-  //   readAllSensors();
-    
-  //   // Update pump status and edge detection
-  //   servicePumpEdgeAndStatus();
-    
-  //   // Service protection timer
-  //   serviceStartProtection();
-  // }
-  
-  // // Print CPU temperature periodically
-  // printCPUTemperature();
-  
-  // // Safety loop for relay latch
-  // latchRelaySafetyLoop();
 }
 
 
@@ -298,38 +203,11 @@ void loop() {
 
 // ----------------- EQUIPMENT CONTROL -----------------
 void turnOffPump() {
-  if (!isPumpOn()) {
-    DEBUG_PRINTLN(F("Pump is already off."));
-    return;
-  }
-  DEBUG_PRINTLN(F("Turn off equipment (pump)"));
-  digitalWrite(PWR_OFF_PIN, HIGH);
-  delay(1000);
-  digitalWrite(PWR_OFF_PIN, LOW);
-  delay(10);
+  pump.requestTurnOff();
 }
 
 void turnOnPump() {
-  if (protectOnStart) {
-    unsigned long elapsed = millis() - protectStartMs;
-    DEBUG_PRINT(F("Turn ON request ignored: currently in protection. ("));
-    DEBUG_PRINT(elapsed / 1000UL);
-    DEBUG_PRINTLN(F(" s)."));
-    return;
-  }
-
-  WDT_RESET();
-  if (isPumpOn()) {
-    DEBUG_PRINTLN(F("Pump is already off."));
-    return;
-  }
-  DEBUG_PRINTLN(F("Turn on equipment (pump)"));
-  digitalWrite(PWR_ON_PIN, HIGH);
-  delay(onPulse);
-  WDT_RESET();
-  delay(onPulse);
-  digitalWrite(PWR_ON_PIN, LOW);
-  delay(10);
+  pump.requestTurnOn();
 }
 
 
@@ -391,11 +269,11 @@ bool readPowerStatus() {
 }
 
 /**
- * Read pump contact status with debounce
+ * Read pump contact status (from PumpDevice debounced state)
  * @return true if pump is on
  */
 bool readPumpStatus() {
-  return isPumpOn();
+  return pump.isPumpOn();
 }
 
 /**
@@ -441,8 +319,8 @@ void readAllSensors() {
   sensorData.totalFlow = waterMeter.getCumulativeFlow();
   sensorData.waterMeterValid = waterMeter.isLastReadingValid();
   
-  // Update global pump variable
-  pump = sensorData.pumpOn ? 1 : 0;
+  // Pump status from PumpDevice (debounce + edge detection inside device)
+  sensorData.pumpOn = pump.isPumpOn();
 }
 
 /**
@@ -471,24 +349,21 @@ void printSensorData() {
 }
 
 void latchRelaySafetySetup() {
-  if (!isPumpOn()) {
+  if (!pump.isPumpOn()) {
     DEBUG_PRINTLN(F("Initial state: pump OFF. Reset Latch."));
     digitalWrite(PWR_OFF_PIN, HIGH);
     delay(1000);
     digitalWrite(PWR_OFF_PIN, LOW);
     delay(20);
   } else {
-    DEBUG_PRINTLN(F("Initial state: pump OFF."));
+    DEBUG_PRINTLN(F("Initial state: pump ON."));
   }
 }
 
 void latchRelaySafetyLoop() {
-  if (!isPumpOn() && serverOnCommand == true) {
-    DEBUG_PRINTLN("Turning pump OFF for safety (inside loop).");
-    digitalWrite(PWR_OFF_PIN, HIGH);
-    delay(1000);
-    digitalWrite(PWR_OFF_PIN, LOW);
-    delay(20);
+  if (!pump.isPumpOn() && serverOnCommand) {
+    DEBUG_PRINTLN(F("Turning pump OFF for safety (inside loop)."));
+    pump.requestTurnOff();
     serverOnCommand = false;
   }
 }
