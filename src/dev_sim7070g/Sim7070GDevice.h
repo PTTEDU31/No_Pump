@@ -42,11 +42,12 @@ enum ModemState {
 };
 
 // Message buffer structure (renamed to avoid conflict with Sim7070G::MQTTMessage)
+#define MQTT_BUFFER_PAYLOAD_MAX 1024  // Telemetry hex payload can be ~900 bytes
 struct MQTTBufferedMessage {
   unsigned long timestamp;  // millis() when message was queued
   char topic[96];          // MQTT topic
-  char payload[256];       // Message payload
-  uint8_t qos;            // Quality of Service
+  char payload[MQTT_BUFFER_PAYLOAD_MAX];  // Message payload (telemetry hex)
+  uint8_t qos;             // Quality of Service
 };
 
 // Statistics structure
@@ -79,6 +80,17 @@ public:
   int start() override;
   int timeout() override;
   int event() override;
+  
+  // Telemetry / MQTT helpers
+  Sim7070G* getModem() { return _modem; }
+  bool isMqttConnected() const;
+  bool publishTelemetryNow(const char* payload);
+  /** Enqueue telemetry to MQTT buffer; sent automatically when connected */
+  bool enqueueTelemetry(const char* payload);
+  int getCSQ();  // 0-31, -1 on fail
+  uint32_t getModemRestarts() const { return _stats.modemRestarts; }
+  uint32_t getGprsConnects() const { return _stats.gprsConnects; }
+  uint32_t getMqttConnects() const { return _stats.mqttConnects; }
   
 private:
   static Sim7070GDevice* s_instance;

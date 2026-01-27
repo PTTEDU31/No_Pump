@@ -10,6 +10,7 @@
 #include "DEBUG.h"
 #include "dev_sim7070g/Sim7070GDevice.h"
 #include "dev_pump/PumpDevice.h"
+#include "crypto_json_utils.h"
 
 ///////////////////////////////////////////////////////////////////////////
 // CREDENTIALS - Change these values from the portal
@@ -49,6 +50,8 @@ bool serverOnCommand = false;
 unsigned long lastRestartMs = 0;
 unsigned long lastTempCheck = 0;
 unsigned long lastSensorRead = 0;
+unsigned long lastPublish = 0;
+unsigned long publishIntervalMs = PUB_FAST_MS;
 
 int vibrationCount = 0;
 int EventCountTotal = 0;
@@ -125,6 +128,9 @@ float readCPUTemperature();
 void readAllSensors();
 void printSensorData();
 
+// Telemetry: collect, encrypt, publish to MQTT
+bool publishTelemetry();
+
 // ========== STATIC INLINE FUNCTION IMPLEMENTATIONS ==========
 static inline bool isPwrPresent() {
   byte highs = 0;
@@ -198,6 +204,19 @@ void loop() {
   
   // Update all devices via DeviceManager (handles timeout callbacks)
   DeviceManager::getInstance().update(millis());
+  
+  // Safety: if server commanded ON but pump is OFF, turn off command
+  latchRelaySafetyLoop();
+  
+  // Periodic telemetry: collect data and publish to MQTT
+  if (modem.isMqttConnected()) {
+    unsigned long now = millis();
+    if ((unsigned long)(now - lastPublish) >= (unsigned long)publishIntervalMs) {
+      if (publishTelemetry()) {
+        lastPublish = now;
+      }
+    }
+  }
 }
 
 
@@ -349,6 +368,113 @@ void printSensorData() {
   DEBUG_PRINT(F(" m³/h | Total: ")); DEBUG_PRINT(sensorData.totalFlow);
   DEBUG_PRINTLN(F(" m³"));
   DEBUG_PRINTLN(F("=================="));
+}
+
+/**
+ * Collect sensor data, build JSON, encrypt, and publish to MQTT.
+ * Updates publishIntervalMs based on PWR and battery (PUB_FAST / PUB_SLOW).
+ * @return true if published successfully, false otherwise
+ */
+bool publishTelemetry() {
+  readAllSensors();
+  
+  int PWR = sensorData.powerPresent ? 1 : 0;
+  int B = sensorData.batteryPercent;
+  
+  // Publish rate: PWR=1 -> fast; else battery hysteresis
+  if (PWR == 1) {
+    if (publishIntervalMs != PUB_FAST_MS) {
+      publishIntervalMs = PUB_FAST_MS;
+      DEBUG_PRINT(F("[TELEM] PWR=1 -> fast publish: "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    }
+  } else {
+    if (publishIntervalMs == PUB_FAST_MS && B < (int)BAT_THRESH_PCT) {
+      publishIntervalMs = PUB_SLOW_MS;
+      DEBUG_PRINT(F("[TELEM] Low battery, PWR=0 -> slow publish: "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    } else if (publishIntervalMs == PUB_SLOW_MS && B >= (int)(BAT_THRESH_PCT + BAT_HYST_PCT)) {
+      publishIntervalMs = PUB_FAST_MS;
+      DEBUG_PRINT(F("[TELEM] Battery restored -> fast publish: "));
+      DEBUG_PRINTLN(publishIntervalMs);
+    }
+  }
+  
+  int V1 = sensorData.V1;
+  int V2 = sensorData.V2;
+  int V3 = sensorData.V3;
+  int X = sensorData.pumpOn ? 1 : 0;
+  int Prot = pump.isProtectionActive() ? 1 : 0;
+  int CSQ = modem.getCSQ();
+  if (CSQ < 0) CSQ = 0;
+  float TCPU = sensorData.cpuTempValid ? sensorData.cpuTemp : -127.0f;
+  float FLOW = sensorData.flowRate;
+  float TOT = sensorData.totalFlow;
+  uint32_t RSIM = modem.getModemRestarts();
+  uint32_t RGPRS = modem.getGprsConnects();
+  uint32_t RMQTT = modem.getMqttConnects();
+  
+  char tsZ[21] = {0};
+  bool haveTs = modem.getModem() && modem.getModem()->getNetworkTimeISO8601(tsZ, sizeof(tsZ));
+  
+  char plain[420];
+  if (haveTs) {
+    snprintf(plain, sizeof(plain),
+             "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
+             "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
+             "\"TCPU\":%.1f,"
+             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
+             "\"PWR\":%d,\"AT_UTC\":\"%s\"}",
+             V1, V2, V3, X, Prot, B, CSQ,
+             TCPU, FLOW, TOT,
+             (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
+             PWR, tsZ);
+  } else {
+    snprintf(plain, sizeof(plain),
+             "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
+             "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
+             "\"TCPU\":%.1f,"
+             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
+             "\"PWR\":%d,\"AT_UTC\":null}",
+             V1, V2, V3, X, Prot, B, CSQ,
+             TCPU, FLOW, TOT,
+             (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
+             PWR);
+  }
+  
+  DEBUG_PRINT(F("[TELEM] JSON: "));
+  DEBUG_PRINTLN(plain);
+  
+  uint8_t nonce[12];
+  uint8_t ct[420];
+  uint8_t tag[16];
+  makeNonce12(nonce, modem.getModem());
+  size_t ctLen = encryptPayload(plain, ct, tag, nonce);
+  if (ctLen == 0) {
+    DEBUG_PRINTLN(F("[TELEM] Encrypt failed"));
+    return false;
+  }
+  
+  char hexPayload[1024];
+  size_t o = 0;
+  hexEncode(nonce, 12, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += 24;
+  hexEncode(ct, ctLen, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += ctLen * 2;
+  hexEncode(tag, 16, hexPayload + o, sizeof(hexPayload) - o, true);
+  o += 32;
+  hexPayload[o] = '\0';
+
+  // Push to MQTT buffer; modem will send automatically when connected
+  bool ok = modem.enqueueTelemetry(hexPayload);
+  if (ok) {
+    DEBUG_PRINTLN(F("[TELEM] Enqueued OK"));
+  } else {
+    DEBUG_PRINTLN(F("[TELEM] Enqueue failed (buffer full?)"));
+  }
+  return ok;
 }
 
 void latchRelaySafetySetup() {

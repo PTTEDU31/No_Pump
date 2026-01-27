@@ -869,10 +869,10 @@ int Sim7070GDevice::timeout()
     //   }
     // }
 
-    // if (_bufferCount > 0)
-    // {
-    //   flushMessageBuffer();
-    // }
+    // Auto-flush buffered MQTT messages (e.g. telemetry)
+    if (_bufferCount > 0) {
+      flushMessageBuffer();
+    }
 
     return 20000;
 
@@ -1070,6 +1070,27 @@ bool Sim7070GDevice::flushMessageBuffer()
   DEBUG_PRINTLN(F(" remaining"));
 
   return (failCount == 0);
+}
+
+bool Sim7070GDevice::isMqttConnected() const {
+  return _state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected();
+}
+
+bool Sim7070GDevice::publishTelemetryNow(const char* payload) {
+  if (!isMqttConnected() || !_modem || !payload) return false;
+  return _modem->mqttPublish(_pubTopic, payload, 1, false);
+}
+
+bool Sim7070GDevice::enqueueTelemetry(const char* payload) {
+  if (!payload) return false;
+  return enqueueMessage(_pubTopic, payload, 1);
+}
+
+int Sim7070GDevice::getCSQ() {
+  int8_t rssi = -1;
+  if (!_modem || !_modem->getSignalQuality(&rssi, nullptr)) return -1;
+  if (rssi < 0 || rssi > 31) return 0;
+  return (int)rssi;
 }
 
 // Async command callback handlers
