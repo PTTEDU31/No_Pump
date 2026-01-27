@@ -15,10 +15,10 @@
 ///////////////////////////////////////////////////////////////////////////
 // CREDENTIALS - Change these values from the portal
 ///////////////////////////////////////////////////////////////////////////
-const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-const char* USERNAME = "node_d935168a3a77";
-const char* PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
-const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
+const char *NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
+const char *USERNAME = "node_d935168a3a77";
+const char *PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
+const char *CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
 // const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
 // const char* NODE_ID = "001";
 // const char* USERNAME = "";
@@ -35,10 +35,12 @@ const int mqtt_port = 1883;
 TemperatureZero tempSAMD;
 
 // Watchdog helpers
-static inline void WDT_INIT() {
+static inline void WDT_INIT()
+{
   Watchdog.enable(HW_WDT_TIMEOUT_SEC * 1000);
 }
-static inline void WDT_RESET() {
+static inline void WDT_RESET()
+{
   Watchdog.reset();
 }
 ///////////////////////////////////////////////////////////////////////////
@@ -59,32 +61,33 @@ int EventCountTotal = 0;
 ///////////////////////////////////////////////////////////////////////////
 // SENSOR DATA STRUCTURE
 ///////////////////////////////////////////////////////////////////////////
-struct SensorData {
+struct SensorData
+{
   // AC Transducer readings (V1, V2, V3)
   int V1;
   int V2;
   int V3;
-  
+
   // Battery voltage and percentage
   float batteryVolts;
   int batteryPercent;
-  
+
   // Power status
-  bool powerPresent;  // Main power line present
-  
+  bool powerPresent; // Main power line present
+
   // Pump status
-  bool pumpOn;        // Pump contact status
-  
+  bool pumpOn; // Pump contact status
+
   // CPU temperature
   float cpuTemp;
-  
+
   // Water meter data (from ModbusWaterMeter device)
-  float flowRate;     // Current flow (m³/h)
-  float totalFlow;   // Cumulative flow (m³)
-  
+  float flowRate;  // Current flow (m³/h)
+  float totalFlow; // Cumulative flow (m³)
+
   // Timestamp
   unsigned long timestamp;
-  
+
   // Validity flags
   bool batteryValid;
   bool cpuTempValid;
@@ -109,7 +112,7 @@ Sim7070GDevice modem(&sim7070, NODE_ID);
 PumpDevice pump(CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN);
 
 // Export pump device reference for Sim7070GDevice
-PumpDevice* g_pumpDevice = &pump;
+PumpDevice *g_pumpDevice = &pump;
 
 // ----------------- PROTOTYPES -----------------
 void turnOnPump();
@@ -132,7 +135,8 @@ void printSensorData();
 bool publishTelemetry();
 
 // ========== STATIC INLINE FUNCTION IMPLEMENTATIONS ==========
-static inline bool isPwrPresent() {
+static inline bool isPwrPresent()
+{
   byte highs = 0;
   highs += (digitalRead(Input_Supply_V) == HIGH);
   delay(20);
@@ -145,33 +149,37 @@ static inline bool isPwrPresent() {
   WDT_RESET();
   highs += (digitalRead(Input_Supply_V) == HIGH);
 
-  if (highs == 4) {
+  if (highs == 4)
+  {
     prevPwrOn = true;
     return true;
   }
-  if (highs == 0) {
+  if (highs == 0)
+  {
     prevPwrOn = false;
     return false;
   }
-  return prevPwrOn;  // ambiguous zone: keep state
+  return prevPwrOn; // ambiguous zone: keep state
 }
 
 // ========== END STATIC INLINE FUNCTIONS ==========
 
 // Mandatory ISR to manage interruptions of SERCOM0
-void SERCOM0_Handler() {
+void SERCOM0_Handler()
+{
   RS485.IrqHandler();
 }
 
 // Device array for DeviceManager
-Device* devices[] = {
+Device *devices[] = {
     &waterMeter,
     &modem,
     &pump,
 };
 
 // ----------------- SETUP -----------------
-void setup() {
+void setup()
+{
   // WDT_INIT();
   delay(2000);
 
@@ -181,58 +189,56 @@ void setup() {
   // Initialize Serial for debugging
   Serial.begin(115200);
   DEBUG_PRINTLN(F("Starting initialization..."));
-  
+
   // Register devices with DeviceManager
   DeviceManager::getInstance().registerDevices(devices, sizeof(devices) / sizeof(devices[0]));
   DEBUG_PRINTLN(F("[DEVICE] Devices registered"));
-  
+
   // Initialize all devices (PumpDevice configures PWR_ON, PWR_OFF, CONTACT pins)
   DeviceManager::getInstance().init();
   DEBUG_PRINTLN(F("[DEVICE] Devices initialized"));
-  
+
   // Latch relay safety: if pump contact says OFF, pulse OFF to reset relay state
   latchRelaySafetySetup();
-  
+
   // Start all devices
   DeviceManager::getInstance().start();
   DEBUG_PRINTLN(F("[DEVICE] Devices started"));
 }
 
 // ----------------- LOOP -----------------
-void loop() {
+void loop()
+{
   // WDT_RESET();
-  
+
   // Update all devices via DeviceManager (handles timeout callbacks)
   DeviceManager::getInstance().update(millis());
-  
+
   // Safety: if server commanded ON but pump is OFF, turn off command
   latchRelaySafetyLoop();
-  
+
   // Periodic telemetry: collect data and publish to MQTT
-  if (modem.isMqttConnected()) {
-    unsigned long now = millis();
-    if ((unsigned long)(now - lastPublish) >= (unsigned long)publishIntervalMs) {
-      if (publishTelemetry()) {
-        lastPublish = now;
-      }
+  
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastPublish) >= (unsigned long)publishIntervalMs)
+  {
+    if (publishTelemetry())
+    {
+      lastPublish = now;
     }
   }
 }
 
-
-
-
-
 // ----------------- EQUIPMENT CONTROL -----------------
-void turnOffPump() {
+void turnOffPump()
+{
   pump.requestTurnOff();
 }
 
-void turnOnPump() {
+void turnOnPump()
+{
   pump.requestTurnOn();
 }
-
-
 
 // ============================================================================
 // SENSOR READING FUNCTIONS
@@ -243,30 +249,34 @@ void turnOnPump() {
  * @param pin Analog pin number
  * @return Averaged ADC reading scaled by 0.1299
  */
-int readAverage(uint8_t pin) {
+int readAverage(uint8_t pin)
+{
   long sum = 0;
-  for (byte i = 0; i < 3; i++) {
+  for (byte i = 0; i < 3; i++)
+  {
     sum += analogRead(pin);
     delay(10);
     WDT_RESET();
   }
-  return (sum / 3) * 0.1299;  // Scale factor for Nano33IoT
+  return (sum / 3) * 0.1299; // Scale factor for Nano33IoT
 }
 
 /**
  * Read battery voltage with averaging (8 samples)
  * @return Battery voltage in volts
  */
-float readBatteryVolts() {
+float readBatteryVolts()
+{
   long sum = 0;
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 8; i++)
+  {
     sum += analogRead(BATT_VOLTS);
     delay(2);
     WDT_RESET();
   }
   float raw = sum / 8.0f;
-  float v_adc = raw * (ADC_VREF / ADC_MAX);               // volts on the pin
-  float v_bat = v_adc * ((R_TOP + R_BOTTOM) / R_BOTTOM);  // voltage divider scale
+  float v_adc = raw * (ADC_VREF / ADC_MAX);              // volts on the pin
+  float v_bat = v_adc * ((R_TOP + R_BOTTOM) / R_BOTTOM); // voltage divider scale
   return v_bat;
 }
 
@@ -275,7 +285,8 @@ float readBatteryVolts() {
  * @param volts Battery voltage
  * @return Battery percentage (0-100)
  */
-int calculateBatteryPercent(float volts) {
+int calculateBatteryPercent(float volts)
+{
   const float V_MIN = 3.00f;
   const float V_MAX = 4.05f;
   float percent = constrain((volts - V_MIN) * (100.0f / (V_MAX - V_MIN)), 0.0f, 100.0f);
@@ -286,7 +297,8 @@ int calculateBatteryPercent(float volts) {
  * Read main power supply status with debounce
  * @return true if main power is present
  */
-bool readPowerStatus() {
+bool readPowerStatus()
+{
   return isPwrPresent();
 }
 
@@ -294,7 +306,8 @@ bool readPowerStatus() {
  * Read pump contact status (from PumpDevice debounced state)
  * @return true if pump is on
  */
-bool readPumpStatus() {
+bool readPumpStatus()
+{
   return pump.isPumpOn();
 }
 
@@ -302,9 +315,11 @@ bool readPumpStatus() {
  * Read CPU internal temperature
  * @return CPU temperature in Celsius, or -127.0 if invalid
  */
-float readCPUTemperature() {
+float readCPUTemperature()
+{
   float cpuC = tempSAMD.readInternalTemperature();
-  if (isnan(cpuC)) {
+  if (isnan(cpuC))
+  {
     return -127.0f;
   }
   return cpuC;
@@ -313,34 +328,35 @@ float readCPUTemperature() {
 /**
  * Read all sensors and update sensorData structure
  */
-void readAllSensors() {
+void readAllSensors()
+{
   sensorData.timestamp = millis();
-  
+
   // Read AC Transducer inputs (V1, V2, V3)
   sensorData.V1 = readAverage(ADC_PIN_1);
   sensorData.V2 = readAverage(ADC_PIN_2);
   sensorData.V3 = readAverage(ADC_PIN_3);
-  
+
   // Read battery voltage and calculate percentage
   sensorData.batteryVolts = readBatteryVolts();
   sensorData.batteryPercent = calculateBatteryPercent(sensorData.batteryVolts);
   sensorData.batteryValid = (sensorData.batteryVolts > 2.5f && sensorData.batteryVolts < 5.0f);
-  
+
   // Read power status
   sensorData.powerPresent = readPowerStatus();
-  
+
   // Read pump status
   sensorData.pumpOn = readPumpStatus();
-  
+
   // Read CPU temperature
   sensorData.cpuTemp = readCPUTemperature();
   sensorData.cpuTempValid = (sensorData.cpuTemp > -100.0f && sensorData.cpuTemp < 100.0f);
-  
+
   // Read water meter data from device
   sensorData.flowRate = waterMeter.getCurrentFlow();
   sensorData.totalFlow = waterMeter.getCumulativeFlow();
   sensorData.waterMeterValid = waterMeter.isLastReadingValid();
-  
+
   // Pump status from PumpDevice (debounce + edge detection inside device)
   sensorData.pumpOn = pump.isPumpOn();
 }
@@ -348,24 +364,35 @@ void readAllSensors() {
 /**
  * Print all sensor data for debugging
  */
-void printSensorData() {
+void printSensorData()
+{
   DEBUG_PRINTLN(F("=== SENSOR DATA ==="));
-  DEBUG_PRINT(F("V1: ")); DEBUG_PRINT(sensorData.V1);
-  DEBUG_PRINT(F(" | V2: ")); DEBUG_PRINT(sensorData.V2);
-  DEBUG_PRINT(F(" | V3: ")); DEBUG_PRINTLN(sensorData.V3);
-  
-  DEBUG_PRINT(F("Battery: ")); DEBUG_PRINT(sensorData.batteryVolts);
-  DEBUG_PRINT(F("V (")); DEBUG_PRINT(sensorData.batteryPercent);
+  DEBUG_PRINT(F("V1: "));
+  DEBUG_PRINT(sensorData.V1);
+  DEBUG_PRINT(F(" | V2: "));
+  DEBUG_PRINT(sensorData.V2);
+  DEBUG_PRINT(F(" | V3: "));
+  DEBUG_PRINTLN(sensorData.V3);
+
+  DEBUG_PRINT(F("Battery: "));
+  DEBUG_PRINT(sensorData.batteryVolts);
+  DEBUG_PRINT(F("V ("));
+  DEBUG_PRINT(sensorData.batteryPercent);
   DEBUG_PRINTLN(F("%)"));
-  
-  DEBUG_PRINT(F("Power: ")); DEBUG_PRINTLN(sensorData.powerPresent ? F("ON") : F("OFF"));
-  DEBUG_PRINT(F("Pump: ")); DEBUG_PRINTLN(sensorData.pumpOn ? F("ON") : F("OFF"));
-  
-  DEBUG_PRINT(F("CPU Temp: ")); DEBUG_PRINT(sensorData.cpuTemp);
+
+  DEBUG_PRINT(F("Power: "));
+  DEBUG_PRINTLN(sensorData.powerPresent ? F("ON") : F("OFF"));
+  DEBUG_PRINT(F("Pump: "));
+  DEBUG_PRINTLN(sensorData.pumpOn ? F("ON") : F("OFF"));
+
+  DEBUG_PRINT(F("CPU Temp: "));
+  DEBUG_PRINT(sensorData.cpuTemp);
   DEBUG_PRINTLN(F(" °C"));
-  
-  DEBUG_PRINT(F("Flow: ")); DEBUG_PRINT(sensorData.flowRate);
-  DEBUG_PRINT(F(" m³/h | Total: ")); DEBUG_PRINT(sensorData.totalFlow);
+
+  DEBUG_PRINT(F("Flow: "));
+  DEBUG_PRINT(sensorData.flowRate);
+  DEBUG_PRINT(F(" m³/h | Total: "));
+  DEBUG_PRINT(sensorData.totalFlow);
   DEBUG_PRINTLN(F(" m³"));
   DEBUG_PRINTLN(F("=================="));
 }
@@ -375,50 +402,60 @@ void printSensorData() {
  * Updates publishIntervalMs based on PWR and battery (PUB_FAST / PUB_SLOW).
  * @return true if published successfully, false otherwise
  */
-bool publishTelemetry() {
+bool publishTelemetry()
+{
   readAllSensors();
-  
+
   int PWR = sensorData.powerPresent ? 1 : 0;
   int B = sensorData.batteryPercent;
-  
+
   // Publish rate: PWR=1 -> fast; else battery hysteresis
-  if (PWR == 1) {
-    if (publishIntervalMs != PUB_FAST_MS) {
+  if (PWR == 1)
+  {
+    if (publishIntervalMs != PUB_FAST_MS)
+    {
       publishIntervalMs = PUB_FAST_MS;
       DEBUG_PRINT(F("[TELEM] PWR=1 -> fast publish: "));
       DEBUG_PRINTLN(publishIntervalMs);
     }
-  } else {
-    if (publishIntervalMs == PUB_FAST_MS && B < (int)BAT_THRESH_PCT) {
+  }
+  else
+  {
+    if (publishIntervalMs == PUB_FAST_MS && B < (int)BAT_THRESH_PCT)
+    {
       publishIntervalMs = PUB_SLOW_MS;
       DEBUG_PRINT(F("[TELEM] Low battery, PWR=0 -> slow publish: "));
       DEBUG_PRINTLN(publishIntervalMs);
-    } else if (publishIntervalMs == PUB_SLOW_MS && B >= (int)(BAT_THRESH_PCT + BAT_HYST_PCT)) {
+    }
+    else if (publishIntervalMs == PUB_SLOW_MS && B >= (int)(BAT_THRESH_PCT + BAT_HYST_PCT))
+    {
       publishIntervalMs = PUB_FAST_MS;
       DEBUG_PRINT(F("[TELEM] Battery restored -> fast publish: "));
       DEBUG_PRINTLN(publishIntervalMs);
     }
   }
-  
+
   int V1 = sensorData.V1;
   int V2 = sensorData.V2;
   int V3 = sensorData.V3;
   int X = sensorData.pumpOn ? 1 : 0;
   int Prot = pump.isProtectionActive() ? 1 : 0;
   int CSQ = modem.getCSQ();
-  if (CSQ < 0) CSQ = 0;
+  if (CSQ < 0)
+    CSQ = 0;
   float TCPU = sensorData.cpuTempValid ? sensorData.cpuTemp : -127.0f;
   float FLOW = sensorData.flowRate;
   float TOT = sensorData.totalFlow;
   uint32_t RSIM = modem.getModemRestarts();
   uint32_t RGPRS = modem.getGprsConnects();
   uint32_t RMQTT = modem.getMqttConnects();
-  
+
   char tsZ[21] = {0};
   bool haveTs = modem.getModem() && modem.getModem()->getNetworkTimeISO8601(tsZ, sizeof(tsZ));
-  
+
   char plain[420];
-  if (haveTs) {
+  if (haveTs)
+  {
     snprintf(plain, sizeof(plain),
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
@@ -430,7 +467,9 @@ bool publishTelemetry() {
              TCPU, FLOW, TOT,
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR, tsZ);
-  } else {
+  }
+  else
+  {
     snprintf(plain, sizeof(plain),
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
@@ -443,20 +482,21 @@ bool publishTelemetry() {
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR);
   }
-  
+
   DEBUG_PRINT(F("[TELEM] JSON: "));
   DEBUG_PRINTLN(plain);
-  
+
   uint8_t nonce[12];
   uint8_t ct[420];
   uint8_t tag[16];
   makeNonce12(nonce, modem.getModem());
   size_t ctLen = encryptPayload(plain, ct, tag, nonce);
-  if (ctLen == 0) {
+  if (ctLen == 0)
+  {
     DEBUG_PRINTLN(F("[TELEM] Encrypt failed"));
     return false;
   }
-  
+
   char hexPayload[1024];
   size_t o = 0;
   hexEncode(nonce, 12, hexPayload + o, sizeof(hexPayload) - o, true);
@@ -469,28 +509,37 @@ bool publishTelemetry() {
 
   // Push to MQTT buffer; modem will send automatically when connected
   bool ok = modem.enqueueTelemetry(hexPayload);
-  if (ok) {
+  if (ok)
+  {
     DEBUG_PRINTLN(F("[TELEM] Enqueued OK"));
-  } else {
+  }
+  else
+  {
     DEBUG_PRINTLN(F("[TELEM] Enqueue failed (buffer full?)"));
   }
   return ok;
 }
 
-void latchRelaySafetySetup() {
-  if (!pump.isPumpOn()) {
+void latchRelaySafetySetup()
+{
+  if (!pump.isPumpOn())
+  {
     DEBUG_PRINTLN(F("Initial state: pump OFF. Reset Latch."));
     digitalWrite(PWR_OFF_PIN, HIGH);
     delay(1000);
     digitalWrite(PWR_OFF_PIN, LOW);
     delay(20);
-  } else {
+  }
+  else
+  {
     DEBUG_PRINTLN(F("Initial state: pump ON."));
   }
 }
 
-void latchRelaySafetyLoop() {
-  if (!pump.isPumpOn() && serverOnCommand) {
+void latchRelaySafetyLoop()
+{
+  if (!pump.isPumpOn() && serverOnCommand)
+  {
     DEBUG_PRINTLN(F("Turning pump OFF for safety (inside loop)."));
     pump.requestTurnOff();
     serverOnCommand = false;
@@ -500,15 +549,20 @@ void latchRelaySafetyLoop() {
 /**
  * Print CPU temperature periodically (every TEMP_CHECK_INTERVAL_MS)
  */
-void printCPUTemperature() {
-  if ((long)(millis() - lastTempCheck) <= (long)TEMP_CHECK_INTERVAL_MS) return;
+void printCPUTemperature()
+{
+  if ((long)(millis() - lastTempCheck) <= (long)TEMP_CHECK_INTERVAL_MS)
+    return;
   lastTempCheck = millis();
 
   float cpuC = readCPUTemperature();
   DEBUG_PRINT(F("CPU Temp: "));
-  if (cpuC < -100.0f) {
+  if (cpuC < -100.0f)
+  {
     DEBUG_PRINTLN(F("N/A"));
-  } else {
+  }
+  else
+  {
     DEBUG_PRINT(cpuC);
     DEBUG_PRINTLN(F(" °C"));
   }

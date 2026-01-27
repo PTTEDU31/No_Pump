@@ -63,8 +63,8 @@ extern const int mqtt_port;
 // =========================================================================
 #define BAT_THRESH_PCT 90              // Battery percentage threshold that changes publication times
 #define BAT_HYST_PCT 3                 // Hysteresis to change publication time (this avoids jumping configuration)
-#define PUB_FAST_MS 15000UL            // Fast publication (when above battery threshold)
-#define PUB_SLOW_MS 30000UL            // Slow publication (when below battery threshold)
+#define PUB_FAST_MS 60000UL            // Fast publication (when above battery threshold)
+#define PUB_SLOW_MS 150000UL            // Slow publication (when below battery threshold)
 
 // =========================================================================
 // TIMING CONSTANTS

@@ -117,7 +117,7 @@ int Sim7070GDevice::start()
   _mqttBegun = false;
   _lastHeartbeatMs = 0;
 
-  // Bắt đầu với bật nguồn
+  // Start by powering on modem
   updateState(MODEM_POWER_ON);
   return DURATION_IMMEDIATELY;
 }
@@ -286,20 +286,15 @@ void Sim7070GDevice::onMqttMessage(const char* topic, const uint8_t* payload, ui
 
   const char* hexStr = hexPayload;
   size_t hexStrLen = strlen(hexStr);
-  
-  // Minimum length: nonce(12) + tag(16) = 28 bytes = 56 hex chars
-  if ((hexStrLen % 2) != 0 || hexStrLen < (12 + 16) * 2) {
-    DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
-    return;
-  }
 
-  // Decode HEX to binary
-  uint8_t buf[480];
-  size_t bytes = 0;
-  if (!hexDecode(hexStr, buf, sizeof(buf), bytes) || bytes < (12 + 16)) {
-    DEBUG_PRINTLN(F("[RX] Invalid HEX (decoding or length)."));
-    return;
-  }
+  // Encrypted path: valid HEX length and successful decode
+  if ((hexStrLen % 2) == 0 && hexStrLen >= (12 + 16) * 2) {
+    uint8_t buf[480];
+    size_t bytes = 0;
+    if (hexDecode(hexStr, buf, sizeof(buf), bytes) && bytes >= (12 + 16)) {
+      DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+      DEBUG_PRINTLN(hexStrLen);
+      DEBUG_PRINTLN(hexPayload);
 
   // Extract nonce, ciphertext, and tag
   uint8_t* nonce = buf;
@@ -379,18 +374,33 @@ void Sim7070GDevice::onMqttMessage(const char* topic, const uint8_t* payload, ui
   DEBUG_PRINT(F("[RX] clear JSON: "));
   DEBUG_PRINTLN(plain);
 
-  // Parse JSON commands
+  handleMqttCommandJson(plain);
+  return;
+  }
+  }  // end if valid hex length
+
+  // Plain text path: payload is not encrypted HEX (e.g. "hello" or {"X":1})
+  DEBUG_PRINTLN(F("[RX] Plain text message"));
+  char plainBuf[512];
+  size_t plainLen = (len < sizeof(plainBuf) - 1) ? len : sizeof(plainBuf) - 1;
+  memcpy(plainBuf, payload, plainLen);
+  plainBuf[plainLen] = '\0';
+  DEBUG_PRINTLN(plainBuf);
+  handleMqttCommandJson(plainBuf);
+}
+
+void Sim7070GDevice::handleMqttCommandJson(const char* plain)
+{
+  if (!plain) return;
+
   long xVal = -1;
   if (jsonGetInt(plain, "X", xVal)) {
-    // Get PumpDevice instance via extern reference (set in main.cpp)
     extern PumpDevice* g_pumpDevice;
     if (!g_pumpDevice) {
       DEBUG_PRINTLN(F("[ACT] PumpDevice not available"));
       return;
     }
-
     if (xVal == 1) {
-      // Turn ON pump
       if (g_pumpDevice->isProtectionActive()) {
         unsigned long remain = g_pumpDevice->getProtectionRemainingMs();
         DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protection ("));
@@ -401,11 +411,9 @@ void Sim7070GDevice::onMqttMessage(const char* topic, const uint8_t* payload, ui
         g_pumpDevice->requestTurnOn();
       }
     } else if (xVal == 0) {
-      // Turn OFF pump
       DEBUG_PRINTLN(F("[ACT] Turning pump OFF"));
       g_pumpDevice->setLastOffByHexFlag(true);
       g_pumpDevice->requestTurnOff();
-      // Arm protection after turning off via HEX command
       g_pumpDevice->armProtection("Turned off by HEX command");
     } else {
       DEBUG_PRINT(F("[ACT] Invalid X Value: "));
@@ -415,15 +423,11 @@ void Sim7070GDevice::onMqttMessage(const char* topic, const uint8_t* payload, ui
     DEBUG_PRINTLN(F("[ACT] JSON without X field."));
   }
 
-  // Parse onPulse parameter
   long newPulse;
   if (jsonGetInt(plain, "onPulse", newPulse)) {
-    // Update onPulse (constrain to 500-10000 ms)
     int onPulse = constrain((int)newPulse, 500, 10000);
     DEBUG_PRINT(F("[ACT] onPulse updated to "));
     DEBUG_PRINTLN(onPulse);
-    // Note: This should update PumpDevice's onPulse setting if it has one
-    // For now, just log it
   }
 }
 
@@ -451,11 +455,11 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Bật nguồn modem..."));
+    DEBUG_PRINTLN(F("[SIM7070G] Powering on modem..."));
     powerPulse();
     updateState(MODEM_ACTIVATE_CNACT_FIRST);
     
-    return 15000; // Đợi modem khởi động
+    return 15000; // Wait for modem to boot
   }
 
   case MODEM_ACTIVATE_CNACT_FIRST:
@@ -465,14 +469,14 @@ int Sim7070GDevice::timeout()
       _modem->loop();
     }
     if (!_modem->checkSendCommandSync("AT", "OK", 1000)) {
-      DEBUG_PRINTLN(F("[SIM7070G] Modem không phản hồi, thử lại..."));
+      DEBUG_PRINTLN(F("[SIM7070G] Modem not responding, retrying..."));
       updateState(MODEM_POWER_ON);
       return 200;
     }
     char ip[16];
     if (_modem->getIPAddress(ip, sizeof(ip)))
     {
-      DEBUG_PRINTLN(F("[SIM7070G] IP đã được cấp trước đó, bỏ qua CNACT..."));
+      DEBUG_PRINTLN(F("[SIM7070G] IP already assigned, skipping CNACT..."));
       DEBUG_PRINT(F("[SIM7070G] IP: "));
       DEBUG_PRINTLN(ip);
       updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
@@ -481,24 +485,24 @@ int Sim7070GDevice::timeout()
     }
    
 
-    DEBUG_PRINTLN(F("[SIM7070G] Khởi tạo kết nối AT+CNACT=1,1..."));
+    DEBUG_PRINTLN(F("[SIM7070G] Initiating AT+CNACT=1,1..."));
     if (_modem->checkSendCommandSync("AT+CNACT=0,1", "OK", 10000)) {
-      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 thành công"));
+      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 success"));
       updateState(MODEM_WAIT_FOR_IP_FIRST);
       _retryCount = 0;
-      return 7000; // Đợi 7 giây
+      return 7000; // Wait 7 seconds
     } else {
-      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 thất bại, thử lại..."));
+      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 failed, retrying..."));
       _retryCount++;
       if (_retryCount >= 3) {
-        // Nếu thất bại 3 lần, chuyển sang apply boot config
-        DEBUG_PRINTLN(F("[SIM7070G] CNACT thất bại sau 3 lần, chuyển sang boot config"));
+        // After 3 failures, switch to apply boot config
+        DEBUG_PRINTLN(F("[SIM7070G] CNACT failed after 3 attempts, switching to boot config"));
         _modem->checkSendCommandSync("AT+CNACT=0,0", "OK", 10000);
         updateState(MODEM_APPLY_BOOT_CONFIG);
         _retryCount = 0;
         return DURATION_IMMEDIATELY;
       }
-      return 5000; // Thử lại sau 5 giây
+      return 5000; // Retry after 5 seconds
     }
   }
 
@@ -508,7 +512,7 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Đợi 10s hoàn tất, kiểm tra IP..."));
+    DEBUG_PRINTLN(F("[SIM7070G] 10s wait done, checking IP..."));
     updateState(MODEM_CHECK_IP_FIRST);
     return DURATION_IMMEDIATELY;
   }
@@ -521,15 +525,15 @@ int Sim7070GDevice::timeout()
     }
     char ip[16];
     if (_modem->getIPAddress(ip, sizeof(ip))) {
-      DEBUG_PRINT(F("[SIM7070G] Kiểm tra IP thành công: "));
+      DEBUG_PRINT(F("[SIM7070G] IP check success: "));
       DEBUG_PRINTLN(ip);
-      // Thành công, chuyển sang MQTT
+      // Success, proceed to MQTT
       updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
       _retryCount = 0;
       return DURATION_IMMEDIATELY;
     } else {
-      DEBUG_PRINTLN(F("[SIM7070G] Kiểm tra IP thất bại, chuyển sang boot config..."));
-      // Không thành công, chuyển sang apply boot config
+      DEBUG_PRINTLN(F("[SIM7070G] IP check failed, switching to boot config..."));
+      // Failed, switch to apply boot config
       updateState(MODEM_APPLY_BOOT_CONFIG);
       _retryCount = 0;
       return DURATION_IMMEDIATELY;
@@ -542,13 +546,13 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Áp dụng boot config..."));
+    DEBUG_PRINTLN(F("[SIM7070G] Applying boot config..."));
     if (!applyBootConfig()) {
-      DEBUG_PRINTLN(F("[SIM7070G] Áp dụng boot config thất bại"));
+      DEBUG_PRINTLN(F("[SIM7070G] Applying boot config failed"));
       updateState(MODEM_ERROR);
       return 10000;
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Boot config thành công"));
+    DEBUG_PRINTLN(F("[SIM7070G] Boot config success"));
     updateState(MODEM_CHECK_SIM_AFTER_CONFIG);
     _retryCount = 0;
     return DURATION_IMMEDIATELY;
@@ -583,7 +587,7 @@ int Sim7070GDevice::timeout()
     int8_t rssi;
     uint8_t ber;
     if (_modem->getSignalQuality(&rssi, &ber)) {
-      DEBUG_PRINT(F("[SIM7070G] Tín hiệu - RSSI: "));
+      DEBUG_PRINT(F("[SIM7070G] Signal - RSSI: "));
       DEBUG_PRINT(rssi);
       DEBUG_PRINT(F(", BER: "));
       DEBUG_PRINTLN(ber);
@@ -591,7 +595,7 @@ int Sim7070GDevice::timeout()
       _retryCount = 0;
       return DURATION_IMMEDIATELY;
     } else {
-      DEBUG_PRINTLN(F("[SIM7070G] Không thể lấy chất lượng tín hiệu, thử lại..."));
+      DEBUG_PRINTLN(F("[SIM7070G] Unable to get signal quality, retrying..."));
       _retryCount++;
       if (_retryCount >= 5) {
         updateState(MODEM_ERROR);
@@ -610,15 +614,15 @@ int Sim7070GDevice::timeout()
     DEBUG_PRINT(F("[SIM7070G] Set APN: "));
     DEBUG_PRINTLN(_apn);
     if (_modem->setAPN(1, _apn, _gprsUser[0] ? _gprsUser : nullptr, _gprsPass[0] ? _gprsPass : nullptr)) {
-      DEBUG_PRINTLN(F("[SIM7070G] Set APN thành công"));
-      // Sau khi set APN, kích hoạt lại CNACT
+      DEBUG_PRINTLN(F("[SIM7070G] Set APN success"));
+      // After set APN, activate CNACT again
       if (_modem->checkSendCommandSync("AT+CNACT=1,1", "OK", 10000)) {
-        DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 sau set APN thành công"));
+        DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 after set APN success"));
         updateState(MODEM_WAIT_FOR_IP_AFTER_APN);
         _retryCount = 0;
-        return 10000; // Đợi 10 giây
+        return 10000; // Wait 10 seconds
       } else {
-        DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 sau set APN thất bại"));
+        DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 after set APN failed"));
         _retryCount++;
         if (_retryCount >= 3) {
           updateState(MODEM_ERROR);
@@ -627,7 +631,7 @@ int Sim7070GDevice::timeout()
         return 5000;
       }
     } else {
-      DEBUG_PRINTLN(F("[SIM7070G] Set APN thất bại"));
+      DEBUG_PRINTLN(F("[SIM7070G] Set APN failed"));
       _retryCount++;
       if (_retryCount >= 3) {
         updateState(MODEM_ERROR);
@@ -643,7 +647,7 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Đợi 10s sau set APN hoàn tất, kiểm tra IP..."));
+    DEBUG_PRINTLN(F("[SIM7070G] 10s wait after set APN done, checking IP..."));
     updateState(MODEM_CHECK_IP_AFTER_APN);
     return DURATION_IMMEDIATELY;
   }
@@ -656,20 +660,20 @@ int Sim7070GDevice::timeout()
     }
     char ip[16];
     if (_modem->getIPAddress(ip, sizeof(ip))) {
-      DEBUG_PRINT(F("[SIM7070G] Kiểm tra IP sau set APN thành công: "));
+      DEBUG_PRINT(F("[SIM7070G] IP check after set APN success: "));
       DEBUG_PRINTLN(ip);
-      // Thành công, chuyển sang MQTT
+      // Success, proceed to MQTT
       updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
       _retryCount = 0;
       return DURATION_IMMEDIATELY;
     } else {
-      DEBUG_PRINTLN(F("[SIM7070G] Kiểm tra IP sau set APN thất bại, thử lại..."));
+      DEBUG_PRINTLN(F("[SIM7070G] IP check after set APN failed, retrying..."));
       _retryCount++;
       if (_retryCount >= 5) {
         updateState(MODEM_ERROR);
         return 10000;
       }
-      return 10000; // Thử lại sau 10 giây
+      return 10000; // Retry after 10 seconds
     }
   }
   case MODEM_SYNC_NTP_TIME:
@@ -763,7 +767,7 @@ int Sim7070GDevice::timeout()
     if(_modem->isMQTTConnected())
     {
       DEBUG_PRINTLN(F("[SIM7070G] MQTT already connected"));
-      _retryCount = 0; // Reset retry count khi vào MODEM_MQTT_CONNECTED_FIRST
+      _retryCount = 0; // Reset retry count when entering MODEM_MQTT_CONNECTED_FIRST
       updateState(MODEM_SYNC_NTP_TIME);
       return 10000;
     }
@@ -791,13 +795,13 @@ int Sim7070GDevice::timeout()
       if(_modem->mqttSubscribe(_subTopic, 1))
       {
         DEBUG_PRINTLN(F("[SIM7070G] Subscribed to MQTT topic successfully"));
-        // Thành công, reset retry count
+        // Success, reset retry count
         _retryCount = 0;
         
         // Publish online status
         char msg[160];
         snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
-        _modem->mqttPublish(_pubTopic, msg, 1, false);
+        _modem->mqttPublish(_pubTopic, msg, 0, false);
         
         _lastHeartbeatMs = millis();
         updateState(MODEM_MQTT_CONNECTED);
@@ -806,53 +810,66 @@ int Sim7070GDevice::timeout()
       else
       {
         _retryCount++;
-        DEBUG_PRINT(F("[SIM7070G] Failed to subscribe to MQTT topic (lần "));
+        DEBUG_PRINT(F("[SIM7070G] Failed to subscribe to MQTT topic (attempt "));
         DEBUG_PRINT(_retryCount);
         DEBUG_PRINTLN(F(")"));
         
         if (_retryCount >= 5) {
-          DEBUG_PRINTLN(F("[SIM7070G] Subscribe thất bại quá 5 lần, đóng và khởi tạo lại MQTT..."));
-          // Đóng kết nối MQTT
+          DEBUG_PRINTLN(F("[SIM7070G] Subscribe failed after 5 attempts, closing and reinitializing MQTT..."));
+          // Close MQTT connection
           if (_modem->isMQTTConnected()) {
             _modem->mqttDisconnect();
-            DEBUG_PRINTLN(F("[SIM7070G] Đã đóng kết nối MQTT"));
+            DEBUG_PRINTLN(F("[SIM7070G] MQTT connection closed"));
           }
-          // Reset MQTT để khởi tạo lại
+          // Reset MQTT to reinitialize
           _mqttBegun = false;
           _retryCount = 0;
-          // Khởi tạo lại MQTT
+          // Reinitialize MQTT
           updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
           return DURATION_IMMEDIATELY;
         } else {
-          // Retry subscribe sau 10 giây
+          // Retry subscribe after 10 seconds
           return 10000;
         }
       }
     }
     
-    // Nếu _modem null, chuyển về error
+    // If _modem null, switch to error
     updateState(MODEM_ERROR);
     return 10000;
   }
 
-  case MODEM_MQTT_CONNECTED:
-    // CRITICAL: Must call loop() to process async operations
+  case MODEM_WAITING_SUCCESS:
+  {
     if (_modem) {
       _modem->loop();
     }
+    if (_waitingDone) {
+      _waitingDone = false;
+      ModemState next = _waitingSuccessNextState;
+      _waitingSuccessNextState = MODEM_OFF;
+      DEBUG_PRINTLN(F("[SIM7070G] Waiting success done, transitioning to next state"));
+      updateState(next);
+      return DURATION_IMMEDIATELY;
+    }
+    return 200;  // Poll lại sau 200 ms
+  }
+
+  case MODEM_MQTT_CONNECTED:
+    // CRITICAL: Must call loop() to process async operations
     handleIncomingData();
 
     // if (!_modem || !_modem->isMQTTConnected())
     // {
     //   _stats.mqttDisconnects++;
-    //   // Kiểm tra lại IP và kết nối lại
+    //   // Recheck IP and reconnect
     //   updateState(MODEM_CHECK_IP_FIRST);
     //   return 2000;
     // }
 
     // if (!_modem->isNetworkConnected())
     // {
-    //   // Mất kết nối mạng, thử lại từ đầu
+    //   // Network lost, retry from start
     //   updateState(MODEM_ACTIVATE_CNACT_FIRST);
     //   return 5000;
     // }
@@ -915,9 +932,22 @@ static const __FlashStringHelper* modemStateName(ModemState s)
     case MODEM_MQTT_CONNECTING: return F("MODEM_MQTT_CONNECTING");
     case MODEM_MQTT_CONNECTED_FIRST: return F("MODEM_MQTT_CONNECTED_FIRST");
     case MODEM_MQTT_CONNECTED: return F("MODEM_MQTT_CONNECTED");
+    case MODEM_WAITING_SUCCESS: return F("MODEM_WAITING_SUCCESS");
     case MODEM_ERROR: return F("MODEM_ERROR");
     default: return F("MODEM_UNKNOWN");
   }
+}
+
+void Sim7070GDevice::gotoWaitingSuccess(ModemState nextState)
+{
+  _waitingDone = false;
+  _waitingSuccessNextState = nextState;
+  updateState(MODEM_WAITING_SUCCESS);
+}
+
+void Sim7070GDevice::setWaitingDone()
+{
+  _waitingDone = true;
 }
 
 void Sim7070GDevice::updateState(ModemState newState)

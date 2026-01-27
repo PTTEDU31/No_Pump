@@ -690,18 +690,20 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\",\"%d\"", _mqttServer, _mqttPort);
   if (!checkSendCommandSync(cmd, "OK", 20000))
     return false;
-  delay(100);
+  delay(200);
 
   // Set clean session
-  // snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLEANSS\",%d", _mqttCleanSession ? 1 : 0);
-  // if (!checkSendCommandSync(cmd, "OK", 5000))
-  //   return false;
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLEANSS\",%d", _mqttCleanSession ? 1 : 0);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
+  delay(100);
   // Set username if provided
   if (_mqttUsername[0] != '\0')
   {
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
+    delay(100);
   }
   // Set password if provided
   if (_mqttPassword[0] != '\0')
@@ -709,14 +711,19 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
+    delay(100);
   }
   // checkSendCommandSync("AT+SMCONF=\"TOPIC\",\"init\"", "OK", 5000);
   // checkSendCommandSync("AT+SMCONF=\"MESSAGE\",\"init message\"", "OK", 5000);
 
-  checkSendCommandSync("AT+SMCONF=\"QOS\",1", "OK", 5000);
+  checkSendCommandSync("AT+SMCONF=\"QOS\",0", "OK", 5000);
+  delay(100);
   checkSendCommandSync("AT+SMCONF=\"SUBHEX\",1", "OK", 5000);
+  delay(100);
   checkSendCommandSync("AT+SMCONF=\"RETAIN\",1", "OK", 5000);
+  delay(100);
   checkSendCommandSync("AT+SMCONF=\"ASYNCMODE\",1", "OK", 5000);
+  delay(100);
 
   return true;
 }
@@ -770,25 +777,21 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
     return false;
   }
 
-  // AT+SMPUB=<topic>,<qos>,<retain>,<length>
+  // AT+SMPUB=<topic>,<qos>,<length>,<retain>
   // Then send payload
   char cmd[256];
   size_t payloadLen = strlen(payload);
   snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic,payloadLen, qos, retain ? 1 : 0);
-
-  if (!_at.sendCommandSync(cmd, 5000))
+  DEBUG_PRINTLN(F("[SMPUB] Command: "));
+  DEBUG_PRINTLN(cmd);
+  if (!_at.sendCommandSync(cmd, 3000))
   {
     return false;
   }
 
   // Send payload
-  _serial->print(payload);
-  _serial->print("\r\n");
-  _serial->flush();
-
-  // Wait for OK
-  delay(100);
-  return _at.sendCommandSync("AT", 5000);
+  _at.sendCommand(payload);
+  return true;
 }
 
 bool Sim7070G::mqttPublishHex(const char *topic, const uint8_t *payload, size_t len, uint8_t qos, bool retain)
@@ -1314,25 +1317,49 @@ void Sim7070G::onURC_SMSUB(const char *urc, const char *data)
   if (!_instance || !_instance->_mqttMessageCallback)
     return;
 
-  // Parse incoming MQTT message
-  // Format: +SMSUB: <topic>,<qos>,<payload_len>,<payload>
+  // Parse incoming MQTT message.
+  // Format from modem UART: +SMSUB: "topic","message"  -> data = "topic","message"
   char topic[128];
-  int qos, payloadLen;
+  char message[512];
+  int n = 0;
 
+  // Try format: "topic","message" (two quoted strings)
+  if (sscanf(data, " \"%127[^\"]\" , \"%511[^\"]\" %n", topic, message, &n) >= 2)
+  {
+    size_t len = strlen(message);
+    _instance->_mqttMessageCallback(topic, (const uint8_t *)message, (uint32_t)len);
+    return;
+  }
+
+  // Fallback: "topic","message" without optional spaces
+  if (sscanf(data, "\"%127[^\"]\",\"%511[^\"]\"", topic, message) >= 2)
+  {
+    size_t len = strlen(message);
+    _instance->_mqttMessageCallback(topic, (const uint8_t *)message, (uint32_t)len);
+    return;
+  }
+
+  // Legacy format: "topic",qos,payload_len,<payload> (if modem sends this variant)
+  int qos, payloadLen;
   if (sscanf(data, "\"%127[^\"]\",%d,%d,", topic, &qos, &payloadLen) >= 3)
   {
-    // Extract payload (after last comma)
-    const char *payloadStart = strrchr(data, ',');
+    const char *payloadStart = strchr(data, ',');
     if (payloadStart)
     {
-      payloadStart++; // Skip comma
-      uint8_t payload[512];
-      size_t len = (payloadLen < sizeof(payload)) ? payloadLen : sizeof(payload);
-
-      // Convert hex string to bytes if needed, or use as-is
-      memcpy(payload, payloadStart, len);
-
-      _instance->_mqttMessageCallback(topic, payload, len);
+      payloadStart = strchr(payloadStart + 1, ',');
+      if (payloadStart)
+      {
+        payloadStart = strchr(payloadStart + 1, ',');
+        if (payloadStart)
+        {
+          payloadStart++;
+          uint8_t payload[512];
+          size_t len = (payloadLen < (int)sizeof(payload)) ? (size_t)payloadLen : sizeof(payload);
+          if (len > 0)
+            memcpy(payload, payloadStart, len);
+          _instance->_mqttMessageCallback(topic, payload, len);
+        }
+      }
     }
   }
 }

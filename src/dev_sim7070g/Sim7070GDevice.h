@@ -38,6 +38,7 @@ enum ModemState {
   MODEM_MQTT_CONNECTING,               // Kết nối MQTT
   MODEM_MQTT_CONNECTED_FIRST,         // MQTT connected lần đầu
   MODEM_MQTT_CONNECTED,               // MQTT connected
+  MODEM_WAITING_SUCCESS,              // Đợi cờ waiting done rồi chuyển sang state chỉ định
   MODEM_ERROR
 };
 
@@ -91,7 +92,12 @@ public:
   uint32_t getModemRestarts() const { return _stats.modemRestarts; }
   uint32_t getGprsConnects() const { return _stats.gprsConnects; }
   uint32_t getMqttConnects() const { return _stats.mqttConnects; }
-  
+
+  /** Chuyển sang trạng thái WAITING_SUCCESS; khi setWaitingDone() được gọi sẽ chuyển sang \p nextState */
+  void gotoWaitingSuccess(ModemState nextState);
+  /** Set cờ "waiting done" – khi đang ở MODEM_WAITING_SUCCESS, lần timeout() tiếp theo sẽ chuyển sang state đã chỉ định trong gotoWaitingSuccess(). */
+  void setWaitingDone();
+
 private:
   static Sim7070GDevice* s_instance;
   static void mqttMessageThunk(const char* topic, const uint8_t* payload, uint32_t len);
@@ -127,7 +133,11 @@ private:
   unsigned long _stateStartTime;  // Timestamp when entering current state
   uint8_t _retryCount;  // Retry counter for state operations
   unsigned long _lastHeartbeatMs = 0;
-  
+
+  // Waiting success state: đợi cờ done rồi chuyển sang state chỉ định
+  bool _waitingDone = false;
+  ModemState _waitingSuccessNextState = MODEM_OFF;
+
   // Message buffer
   MQTTBufferedMessage _messageBuffer[MQTT_BUFFER_SIZE];
   uint8_t _bufferHead;   // Write position
@@ -140,6 +150,7 @@ private:
   void updateState(ModemState newState);
   void handleIncomingData();
   void onMqttMessage(const char* topic, const uint8_t* payload, uint32_t len);
+  void handleMqttCommandJson(const char* plain);
   void powerPulse();
   bool ensureNetworkReady();
   bool ensureMqttReady();
