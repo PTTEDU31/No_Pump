@@ -1,6 +1,8 @@
 #include "Sim7070GDevice.h"
 #include "DEBUG.h"
 #include "config.h"
+#include "crypto_json_utils.h"
+#include "dev_pump/PumpDevice.h"
 
 Sim7070GDevice* Sim7070GDevice::s_instance = nullptr;
 
@@ -97,8 +99,8 @@ int Sim7070GDevice::start()
   DEBUG_PRINTLN(F("[SIM7070G] Starting modem..."));
 
   // MQTT topics
-  snprintf(_pubTopic, sizeof(_pubTopic), "nono/%s", _nodeId);
-  snprintf(_subTopic, sizeof(_subTopic), "nono/%s", _nodeId);
+  snprintf(_pubTopic, sizeof(_pubTopic), "%s", _nodeId);
+  snprintf(_subTopic, sizeof(_subTopic), "%s", _nodeId);
 
   // MQTT credentials
   snprintf(_mqttBroker, sizeof(_mqttBroker), "%s", mqtt_server);
@@ -268,17 +270,160 @@ void Sim7070GDevice::onMqttMessage(const char* topic, const uint8_t* payload, ui
   DEBUG_PRINT(F(" len="));
   DEBUG_PRINTLN(len);
 
-  // TODO: Map message to actions; for now just print payload (truncated)
-  if (payload && len)
-  {
-    const uint32_t maxPrint = 200;
-    uint32_t n = (len > maxPrint) ? maxPrint : len;
-    for (uint32_t i = 0; i < n; i++)
-    {
-      Serial.write((char)payload[i]);
+  if (!payload || len == 0) {
+    return;
+  }
+
+  // Convert payload to null-terminated string (assuming it's HEX string)
+  char hexPayload[600];
+  size_t hexLen = (len > sizeof(hexPayload) - 1) ? sizeof(hexPayload) - 1 : len;
+  memcpy(hexPayload, payload, hexLen);
+  hexPayload[hexLen] = '\0';
+
+  DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+  DEBUG_PRINTLN(strlen(hexPayload));
+  DEBUG_PRINTLN(hexPayload);
+
+  const char* hexStr = hexPayload;
+  size_t hexStrLen = strlen(hexStr);
+  
+  // Minimum length: nonce(12) + tag(16) = 28 bytes = 56 hex chars
+  if ((hexStrLen % 2) != 0 || hexStrLen < (12 + 16) * 2) {
+    DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
+    return;
+  }
+
+  // Decode HEX to binary
+  uint8_t buf[480];
+  size_t bytes = 0;
+  if (!hexDecode(hexStr, buf, sizeof(buf), bytes) || bytes < (12 + 16)) {
+    DEBUG_PRINTLN(F("[RX] Invalid HEX (decoding or length)."));
+    return;
+  }
+
+  // Extract nonce, ciphertext, and tag
+  uint8_t* nonce = buf;
+  uint8_t* tag = buf + (bytes - 16);
+  uint8_t* ct = buf + 12;
+  size_t ctLen = bytes - 12 - 16;
+
+  // Extract time from nonce
+  int nH = nonce[4];
+  int nM = nonce[5];
+  int nS = nonce[6];
+  int secMsg = nH * 3600 + nM * 60 + nS;
+
+  // Get network time (try up to 5 times)
+  char isoNow[21] = { 0 };
+  int rH = 0, rM = 0, rS = 0;
+  bool timeOk = false;
+
+  for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+    DEBUG_PRINT(F("[TIME] Try number "));
+    DEBUG_PRINT(attempt);
+    DEBUG_PRINTLN(F(" to obtain ISO time..."));
+
+    memset(isoNow, 0, sizeof(isoNow));
+    if (_modem && _modem->getNetworkTimeISO8601(isoNow, sizeof(isoNow))) {
+      DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
+      DEBUG_PRINTLN(isoNow);
+
+      if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
+        DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
+        DEBUG_PRINTLN(attempt);
+        timeOk = true;
+        break;
+      } else {
+        DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
+      }
+    } else {
+      DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
     }
-    if (len > maxPrint) { Serial.print(F("...")); }
-    Serial.println();
+
+    delay(200 * attempt);
+  }
+
+  if (!timeOk) {
+    DEBUG_PRINTLN(F("[TIME] Unable to obtain hour from network after 5 tries. Command discarded."));
+    return;
+  }
+
+  // Calculate time difference (circular difference for 24-hour clock)
+  const int secNow = rH * 3600 + rM * 60 + rS;
+  const int DAY = 86400;
+  int d = abs(secMsg - secNow);
+  if (d > DAY) d %= DAY;
+  int dsec = min(d, DAY - d);
+
+  DEBUG_PRINT(F(" | NET HMS="));
+  DEBUG_PRINT(isoNow + 11);
+  DEBUG_PRINT(F(" | Δs="));
+  DEBUG_PRINTLN(dsec);
+
+  // Check time window (30 seconds)
+  const int WINDOW_SEC = 30;
+  if (dsec > WINDOW_SEC) {
+    DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
+    return;
+  }
+
+  // Decrypt payload
+  char plain[420];
+  bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
+  DEBUG_PRINT(F("[DECRYPT] Result: "));
+  DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
+  if (!ok) {
+    return;
+  }
+
+  DEBUG_PRINT(F("[RX] clear JSON: "));
+  DEBUG_PRINTLN(plain);
+
+  // Parse JSON commands
+  long xVal = -1;
+  if (jsonGetInt(plain, "X", xVal)) {
+    // Get PumpDevice instance via extern reference (set in main.cpp)
+    extern PumpDevice* g_pumpDevice;
+    if (!g_pumpDevice) {
+      DEBUG_PRINTLN(F("[ACT] PumpDevice not available"));
+      return;
+    }
+
+    if (xVal == 1) {
+      // Turn ON pump
+      if (g_pumpDevice->isProtectionActive()) {
+        unsigned long remain = g_pumpDevice->getProtectionRemainingMs();
+        DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protection ("));
+        DEBUG_PRINT(remain / 1000UL);
+        DEBUG_PRINTLN(F(" s remaining)."));
+      } else {
+        DEBUG_PRINTLN(F("[ACT] Turning pump ON"));
+        g_pumpDevice->requestTurnOn();
+      }
+    } else if (xVal == 0) {
+      // Turn OFF pump
+      DEBUG_PRINTLN(F("[ACT] Turning pump OFF"));
+      g_pumpDevice->setLastOffByHexFlag(true);
+      g_pumpDevice->requestTurnOff();
+      // Arm protection after turning off via HEX command
+      g_pumpDevice->armProtection("Turned off by HEX command");
+    } else {
+      DEBUG_PRINT(F("[ACT] Invalid X Value: "));
+      DEBUG_PRINTLN(xVal);
+    }
+  } else {
+    DEBUG_PRINTLN(F("[ACT] JSON without X field."));
+  }
+
+  // Parse onPulse parameter
+  long newPulse;
+  if (jsonGetInt(plain, "onPulse", newPulse)) {
+    // Update onPulse (constrain to 500-10000 ms)
+    int onPulse = constrain((int)newPulse, 500, 10000);
+    DEBUG_PRINT(F("[ACT] onPulse updated to "));
+    DEBUG_PRINTLN(onPulse);
+    // Note: This should update PumpDevice's onPulse setting if it has one
+    // For now, just log it
   }
 }
 
@@ -695,7 +840,7 @@ int Sim7070GDevice::timeout()
     if (_modem) {
       _modem->loop();
     }
-    // handleIncomingData();
+    handleIncomingData();
 
     // if (!_modem || !_modem->isMQTTConnected())
     // {

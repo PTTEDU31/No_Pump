@@ -11,12 +11,9 @@
 #define METER_NUM_REGISTERS 0x0002
 
 // Register addresses according to L-MAG-BM protocol
-// Address 4114 (0x1012) = Instantaneous flow rate (m³/s) - Float Inverse format
-// Address 4112 (0x1010) = Instantaneous flow (m³) - Float Inverse format  
-// Address 4120 (0x1018) = Positive cumulative integer part - Long Inverse format
 #define METER_FLOW_UNIT_ADDRESS 0x0006     // Flow unit (0-8): 0=none, 1=m³/s, 2=m³/min, 3=m³/h, 4=m³/d, 5=m³/h, 6=L/s, 7=L/min, 8=L/h
 #define METER_FLOW_RATE_ADDRESS 0x0005     // Flow rate (in unit specified by flow unit register)
-#define METER_CUMULATIVE_ADDRESS 0x00001018  // 4120 decimal - Positive cumulative integer part
+#define METER_CUMULATIVE_ADDRESS 0x000A    // Flow total (cumulative flow) - in unit specified by flow total unit register
 
 // History storage configuration
 #define MAX_HISTORY_SIZE 60  // Store last 60 readings (15 min at 15s interval)

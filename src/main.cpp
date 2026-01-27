@@ -25,7 +25,7 @@ const char* CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5
 ///////////////////////////////////////////////////////////////////////////
 // MQTT SERVER
 ///////////////////////////////////////////////////////////////////////////
-const char mqtt_server[] = "mqtt.myvpn.id.vn";
+const char mqtt_server[] = "broker.remotextr.com";
 const int mqtt_port = 1883;
 
 ///////////////////////////////////////////////////////////////////////////
@@ -104,6 +104,9 @@ Sim7070GDevice modem(&sim7070, NODE_ID);
 
 // Pump Device (control, debounce, protection)
 PumpDevice pump(CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN);
+
+// Export pump device reference for Sim7070GDevice
+PumpDevice* g_pumpDevice = &pump;
 
 // ----------------- PROTOTYPES -----------------
 void turnOnPump();

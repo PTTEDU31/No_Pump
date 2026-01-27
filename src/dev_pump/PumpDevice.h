@@ -41,6 +41,7 @@ public:
   void requestTurnOn();
   void requestTurnOff();
   void setLastOffByHexFlag(bool flag) { _lastOffByHexFlag = flag; }
+  void armProtection(const char* reason) { armStartProtection(reason); }
   
   // Get pump status byte (for compatibility)
   byte getPumpStatusByte() const { return _pumpState ? 1 : 0; }
