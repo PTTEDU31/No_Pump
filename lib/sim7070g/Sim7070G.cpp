@@ -681,11 +681,12 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", _mqttClientId);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
+  delay(100);
   // Set keepalive
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"KEEPTIME\",%d", _mqttKeepalive);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-
+  delay(100);
   // Set server URL
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\",\"%d\"", _mqttServer, _mqttPort);
   if (!checkSendCommandSync(cmd, "OK", 20000))
@@ -703,7 +704,7 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
-    delay(100);
+    delay(1000);
   }
   // Set password if provided
   if (_mqttPassword[0] != '\0')
@@ -711,16 +712,16 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
-    delay(100);
+    delay(200);
   }
   // checkSendCommandSync("AT+SMCONF=\"TOPIC\",\"init\"", "OK", 5000);
   // checkSendCommandSync("AT+SMCONF=\"MESSAGE\",\"init message\"", "OK", 5000);
 
-  checkSendCommandSync("AT+SMCONF=\"QOS\",0", "OK", 5000);
+  checkSendCommandSync("AT+SMCONF=\"QOS\",1", "OK", 5000);
   delay(100);
   checkSendCommandSync("AT+SMCONF=\"SUBHEX\",1", "OK", 5000);
   delay(100);
-  checkSendCommandSync("AT+SMCONF=\"RETAIN\",1", "OK", 5000);
+  checkSendCommandSync("AT+SMCONF=\"RETAIN\",0", "OK", 5000);
   delay(100);
   checkSendCommandSync("AT+SMCONF=\"ASYNCMODE\",1", "OK", 5000);
   delay(100);
@@ -777,20 +778,21 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
     return false;
   }
 
-  // AT+SMPUB=<topic>,<qos>,<length>,<retain>
-  // Then send payload
+  // AT+SMPUB=<topic>,<length>,<qos>,<retain>
+  // Modem responds with ">" then expects payload
   char cmd[256];
   size_t payloadLen = strlen(payload);
-  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic,payloadLen, qos, retain ? 1 : 0);
+  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, payloadLen, qos, retain ? 1 : 0);
   DEBUG_PRINTLN(F("[SMPUB] Command: "));
   DEBUG_PRINTLN(cmd);
-  if (!_at.sendCommandSync(cmd, 3000))
+  if (!checkSendCommandSync(cmd, ">", 500))
   {
-    return false;
+    DEBUG_PRINTLN(F("[SMPUB] Failed to send command (no '>' prompt)"));
   }
 
-  // Send payload
-  _at.sendCommand(payload);
+  // Send payload after ">" prompt
+  _serial->write(payload, payloadLen);
+  _serial->flush();
   return true;
 }
 
@@ -809,29 +811,33 @@ bool Sim7070G::mqttPublishHex(const char *topic, const uint8_t *payload, size_t 
 
   // Publish
   char cmd[256];
-  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, qos, retain ? 1 : 0, len);
+  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic,len, qos, retain ? 1 : 0);
 
-  if (!_at.sendCommandSync(cmd, 5000))
+  if (!checkSendCommandSync(cmd, ">", 200))
   {
-    return false;
+    DEBUG_PRINTLN(F("[SMPUBHEX] Failed to send command"));
+    // return false;
   }
 
-  // Send hex payload
-  for (size_t i = 0; i < len; i++)
-  {
-    if (i > 0 && (i % 32 == 0))
-    {
-      _serial->print("\r\n");
-    }
-    char hex[3];
-    snprintf(hex, sizeof(hex), "%02X", payload[i]);
-    _serial->print(hex);
-  }
-  _serial->print("\r\n");
+  // // Send hex payload
+  // for (size_t i = 0; i < len; i++)
+  // {
+  //   if (i > 0 && (i % 32 == 0))
+  //   {
+  //     _serial->print("\r\n");
+  //   }
+  //   char hex[3];
+  //   snprintf(hex, sizeof(hex), "%02X", payload[i]);
+  //   _serial->print(hex);
+  // }
+  // _serial->print("\r\n");
+  // _serial->flush();
+
+  // sendCommand((const char*)payload, 500, nullptr, nullptr);
+  _serial->write(payload, len);
   _serial->flush();
-
   delay(100);
-  bool result = _at.sendCommandSync("AT", 5000);
+  bool result = checkSendCommandSync("", "OK", 60000);
 
   // Reset to text mode
   _at.sendCommandSync("AT+SMPUBHEX=0", 5000);
@@ -848,7 +854,7 @@ bool Sim7070G::mqttSubscribe(const char *topic, uint8_t qos)
 
   char cmd[256];
   snprintf(cmd, sizeof(cmd), "AT+SMSUB=\"%s\",%d", topic, qos);
-  return _at.sendCommandSync(cmd, 10000);
+  return _at.sendCommandSync(cmd, 30000);
 }
 
 bool Sim7070G::mqttUnsubscribe(const char *topic)
@@ -1280,30 +1286,36 @@ void Sim7070G::processURCs()
 }
 
 // URC Handlers
+// +SMSTATE: 0 = MQTT disconnected, +SMSTATE: 1 = MQTT connected
 void Sim7070G::onURC_SMSTATE(const char *urc, const char *data)
 {
   if (!_instance)
     return;
+  if (!data)
+    return;
 
-  // Parse MQTT state change
-  int state;
-  if (sscanf(data, "%d", &state) == 1)
+  int state = -1;
+  if (sscanf(data, "%d", &state) != 1)
+    return;
+
+  MQTTState mqttState;
+  switch (state)
   {
-    MQTTState mqttState;
-    switch (state)
-    {
-    case 0:
-      mqttState = MQTTState::DISCONNECTED;
-      break;
-    case 1:
-      mqttState = MQTTState::CONNECTED;
-      break;
-    default:
-      mqttState = MQTTState::ERROR;
-      break;
-    }
-    _instance->updateMQTTState(mqttState);
+  case 0:
+    // +SMSTATE: 0 – modem báo MQTT đã ngắt kết nối
+    mqttState = MQTTState::DISCONNECTED;
+    DEBUG_PRINTLN(F("[URC] +SMSTATE: 0 (MQTT disconnected)"));
+    break;
+  case 1:
+    mqttState = MQTTState::CONNECTED;
+    DEBUG_PRINTLN(F("[URC] +SMSTATE: 1 (MQTT connected)"));
+    break;
+  default:
+    mqttState = MQTTState::ERROR;
+    DEBUG_PRINTLN(F("[URC] +SMSTATE: unknown state"));
+    break;
   }
+  _instance->updateMQTTState(mqttState);
 }
 
 void Sim7070G::onURC_SMPUB(const char *urc, const char *data)

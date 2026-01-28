@@ -5,40 +5,28 @@
 #include "device.h"
 #include <Sim7070G.h>
 
-// SIM7070G Configuration
-#define MODEM_BAUD_RATE 19200
-#define MODEM_POWER_PIN 12
-
-// Network configuration
-#define PDP_CONTEXT_ID 0 // 0 is the default context
-#define APN_NAME "iot.1nce.net"
-
-// MQTT Configuration
-#define MQTT_MAX_RECONNECT_ATTEMPTS 3
-#define MQTT_KEEPALIVE_SEC 60
-#define MQTT_BUFFER_SIZE 10  // Maximum number of messages to buffer
-
-
+#include "config.h"
 // Connection states
 enum ModemState {
   MODEM_OFF = 0,
   MODEM_INITIALIZING,
-  MODEM_POWER_ON,                    // Bật nguồn
-  MODEM_ACTIVATE_CNACT_FIRST,         // Kích hoạt CNACT=1,1 lần đầu
-  MODEM_WAIT_FOR_IP_FIRST,            // Đợi 10s sau khi kích hoạt CNACT lần đầu
-  MODEM_CHECK_IP_FIRST,               // Kiểm tra IP lần đầu
-  MODEM_APPLY_BOOT_CONFIG,            // Áp dụng boot config (nếu IP check fail)
-  MODEM_CHECK_SIM_AFTER_CONFIG,       // Kiểm tra SIM sau config
-  MODEM_CHECK_SIGNAL_AFTER_CONFIG,     // Kiểm tra tín hiệu sau config
+  MODEM_POWER_ON,                    // Power on
+  MODEM_RESET,                        // Reset modem
+  MODEM_ACTIVATE_CNACT_FIRST,         // Activate CNACT=1,1 first time
+  MODEM_WAIT_FOR_IP_FIRST,            // Wait 10s after first CNACT activation
+  MODEM_CHECK_IP_FIRST,               // Check IP first time
+  MODEM_APPLY_BOOT_CONFIG,            // Apply boot config (if IP check fails)
+  MODEM_CHECK_SIM_AFTER_CONFIG,       // Check SIM after config
+  MODEM_CHECK_SIGNAL_AFTER_CONFIG,     // Check signal after config
   MODEM_SET_APN,                      // Set APN
-  MODEM_WAIT_FOR_IP_AFTER_APN,        // Đợi 10s sau khi set APN
-  MODEM_CHECK_IP_AFTER_APN,           // Kiểm tra IP sau khi set APN
+  MODEM_WAIT_FOR_IP_AFTER_APN,        // Wait 10s after setting APN
+  MODEM_CHECK_IP_AFTER_APN,           // Check IP after setting APN
   MODEM_SYNC_NTP_TIME,                // Sync NTP time after GPRS connected
-  MODEM_MQTT_CONNECTING_HANDSHAKE,     // Cấu hình MQTT
-  MODEM_MQTT_CONNECTING,               // Kết nối MQTT
-  MODEM_MQTT_CONNECTED_FIRST,         // MQTT connected lần đầu
+  MODEM_MQTT_CONNECTING_HANDSHAKE,     // Configure MQTT
+  MODEM_MQTT_CONNECTING,               // Connect MQTT
+  MODEM_MQTT_CONNECTED_FIRST,         // MQTT connected first time
   MODEM_MQTT_CONNECTED,               // MQTT connected
-  MODEM_WAITING_SUCCESS,              // Đợi cờ waiting done rồi chuyển sang state chỉ định
+  MODEM_WAITING_SUCCESS,              // Wait for done flag then transition to specified state
   MODEM_ERROR
 };
 
@@ -47,6 +35,7 @@ enum ModemState {
 struct MQTTBufferedMessage {
   unsigned long timestamp;  // millis() when message was queued
   char topic[96];          // MQTT topic
+  uint32_t length;         // Message length
   char payload[MQTT_BUFFER_PAYLOAD_MAX];  // Message payload (telemetry hex)
   uint8_t qos;             // Quality of Service
 };
@@ -93,9 +82,9 @@ public:
   uint32_t getGprsConnects() const { return _stats.gprsConnects; }
   uint32_t getMqttConnects() const { return _stats.mqttConnects; }
 
-  /** Chuyển sang trạng thái WAITING_SUCCESS; khi setWaitingDone() được gọi sẽ chuyển sang \p nextState */
+  /** Transition to WAITING_SUCCESS; when setWaitingDone() is called, will transition to \p nextState */
   void gotoWaitingSuccess(ModemState nextState);
-  /** Set cờ "waiting done" – khi đang ở MODEM_WAITING_SUCCESS, lần timeout() tiếp theo sẽ chuyển sang state đã chỉ định trong gotoWaitingSuccess(). */
+  /** Set "waiting done" flag – while in MODEM_WAITING_SUCCESS, the next timeout() will transition to the state specified in gotoWaitingSuccess(). */
   void setWaitingDone();
 
 private:
@@ -134,7 +123,7 @@ private:
   uint8_t _retryCount;  // Retry counter for state operations
   unsigned long _lastHeartbeatMs = 0;
 
-  // Waiting success state: đợi cờ done rồi chuyển sang state chỉ định
+  // Waiting success state: wait for done flag then transition to specified state
   bool _waitingDone = false;
   ModemState _waitingSuccessNextState = MODEM_OFF;
 

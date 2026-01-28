@@ -37,16 +37,16 @@ enum deviceEvent_t {
 };
 
 /**
- * @brief Base class cho tất cả các devices
+ * @brief Base class for all devices
  * 
- * Các device con sẽ kế thừa từ class này và override các phương thức cần thiết
+ * Child devices inherit from this class and override the required methods
  */
 class Device {
 public:
     /**
      * @brief Constructor
-     * @param subscribeEvents Bitset của các events mà device này subscribe
-     * @param core Core ID để chạy device (0 = alternate core, 1 = loop core, -1 = any)
+     * @param subscribeEvents Bitset of events this device subscribes to
+     * @param core Core ID to run device on (0 = alternate core, 1 = loop core, -1 = any)
      */
     Device(uint32_t subscribeEvents = EVENT_NONE, int8_t core = 1);
     
@@ -106,7 +106,7 @@ protected:
 };
 
 /**
- * @brief Device Manager - quản lý tất cả các devices
+ * @brief Device Manager - manages all devices
  */
 class DeviceManager {
 public:

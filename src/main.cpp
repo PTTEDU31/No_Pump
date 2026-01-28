@@ -26,7 +26,9 @@ const char *CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5
 ///////////////////////////////////////////////////////////////////////////
 // MQTT SERVER
 ///////////////////////////////////////////////////////////////////////////
-const char mqtt_server[] = "broker.remotextr.com";
+// const char mqtt_server[] = "broker.remotextr.com";
+const char mqtt_server[] = "mqtt.myvpn.id.vn";
+
 const int mqtt_port = 1883;
 
 ///////////////////////////////////////////////////////////////////////////
@@ -180,9 +182,7 @@ Device *devices[] = {
 // ----------------- SETUP -----------------
 void setup()
 {
-  // WDT_INIT();
-  delay(2000);
-
+  WDT_INIT();
   pinMode(BATT_VOLTS, INPUT);
   pinMode(Input_Supply_V, INPUT);
 
@@ -209,7 +209,7 @@ void setup()
 // ----------------- LOOP -----------------
 void loop()
 {
-  // WDT_RESET();
+  WDT_RESET();
 
   // Update all devices via DeviceManager (handles timeout callbacks)
   DeviceManager::getInstance().update(millis());

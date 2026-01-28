@@ -1,5 +1,6 @@
 #include "Sim7070G_AT.h"
 #include "DEBUG.h"
+#include "Adafruit_SleepyDog.h"
 
 Sim7070G_AT::Sim7070G_AT(HardwareSerial* serial, size_t rxBufferSize)
   : _serial(serial),
@@ -127,7 +128,8 @@ bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout,
   // Wait for response
   while ((millis() - startTime) < timeout) {
     loop();
-    
+    Watchdog.reset();
+
     // Check if command completed (not waiting and has response type)
     if (!sentCmd->waiting && sentCmd->responseType != ATResponseType::NONE) {
       // Command completed
