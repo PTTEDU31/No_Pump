@@ -108,7 +108,7 @@ public:
   bool mqttBegin();
   bool mqttSetConfig(const char* clientId, const char* server, uint16_t port,
                     const char* username = nullptr, const char* password = nullptr,
-                    uint16_t keepalive = 60, bool cleanSession = true);
+                    uint16_t keepalive = 60,const char *topic = nullptr, const char *message = nullptr, uint8_t qos = 0, bool subhex = false, bool retain = false, bool asyncmode = false, bool cleanSession = true);
   bool mqttSetSSL(uint8_t sslIndex = 0);
   bool mqttConnect();
   bool mqttDisconnect();

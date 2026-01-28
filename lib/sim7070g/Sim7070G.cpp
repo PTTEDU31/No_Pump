@@ -642,7 +642,7 @@ bool Sim7070G::mqttBegin()
 
 bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t port,
                              const char *username, const char *password,
-                             uint16_t keepalive, bool cleanSession)
+                             uint16_t keepalive, const char *topic, const char *message, uint8_t qos, bool subhex, bool retain, bool asyncmode, bool cleanSession)
 {
   if (!clientId || !server)
   {
@@ -676,7 +676,22 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   // Set MQTT configuration: AT+SMCONF=<t>,<v>
   // t: type (CLIENTID, URL, KEEPTIME, CLEANSS, QOS, RETAIN, etc.)
   char cmd[256];
-
+  // Set username if provided
+  if (_mqttUsername[0] != '\0')
+  {
+    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
+    if (!checkSendCommandSync(cmd, "OK", 5000))
+      return false;
+    delay(200);
+  }
+  // Set password if provided
+  if (_mqttPassword[0] != '\0')
+  {
+    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
+    if (!checkSendCommandSync(cmd, "OK", 5000))
+      return false;
+    delay(200);
+  }
   // Set client ID
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", _mqttClientId);
   if (!checkSendCommandSync(cmd, "OK", 5000))
@@ -698,32 +713,31 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
   delay(100);
-  // Set username if provided
-  if (_mqttUsername[0] != '\0')
-  {
-    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
-    if (!checkSendCommandSync(cmd, "OK", 5000))
-      return false;
-    delay(1000);
-  }
-  // Set password if provided
-  if (_mqttPassword[0] != '\0')
-  {
-    snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
-    if (!checkSendCommandSync(cmd, "OK", 5000))
-      return false;
-    delay(200);
-  }
-  // checkSendCommandSync("AT+SMCONF=\"TOPIC\",\"init\"", "OK", 5000);
-  // checkSendCommandSync("AT+SMCONF=\"MESSAGE\",\"init message\"", "OK", 5000);
 
-  checkSendCommandSync("AT+SMCONF=\"QOS\",1", "OK", 5000);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"TOPIC\",\"%s\"", topic);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
+  delay(300);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"MESSAGE\",\"%s\"", message);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
   delay(100);
-  checkSendCommandSync("AT+SMCONF=\"SUBHEX\",1", "OK", 5000);
+
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"QOS\",%d", qos);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
   delay(100);
-  checkSendCommandSync("AT+SMCONF=\"RETAIN\",0", "OK", 5000);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"SUBHEX\",%d", subhex ? 1 : 0);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
   delay(100);
-  checkSendCommandSync("AT+SMCONF=\"ASYNCMODE\",1", "OK", 5000);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"RETAIN\",%d", retain ? 1 : 0);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
+  delay(100);
+  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"ASYNCMODE\",%d", asyncmode ? 1 : 0);
+  if (!checkSendCommandSync(cmd, "OK", 5000))
+    return false;
   delay(100);
 
   return true;
@@ -793,6 +807,7 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
   // Send payload after ">" prompt
   _serial->write(payload, payloadLen);
   _serial->flush();
+  checkSendCommandSync("", "OK", 5000);
   return true;
 }
 
@@ -811,7 +826,7 @@ bool Sim7070G::mqttPublishHex(const char *topic, const uint8_t *payload, size_t 
 
   // Publish
   char cmd[256];
-  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic,len, qos, retain ? 1 : 0);
+  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, len, qos, retain ? 1 : 0);
 
   if (!checkSendCommandSync(cmd, ">", 200))
   {
@@ -1509,6 +1524,8 @@ bool Sim7070G::checkSendCommandSync(const char *command, const char *expectedRes
   {
     DEBUG_PRINT(F("[CMD] Command failed: "));
     DEBUG_PRINTLN(command);
+    DEBUG_PRINTLN(F("[CMD] Response failed: "));
+    DEBUG_PRINTLN(response);
     return false;
   }
 

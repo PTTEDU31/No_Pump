@@ -101,9 +101,12 @@ int Sim7070GDevice::start()
 {
   DEBUG_PRINTLN(F("[SIM7070G] Starting modem..."));
 
-  // MQTT topics
-  snprintf(_pubTopic, sizeof(_pubTopic), "%s", _nodeId);
-  snprintf(_subTopic, sizeof(_subTopic), "%s/sub", _nodeId);
+  // MQTT topics - use first 5 characters of nodeId
+  char shortId[6];
+  strncpy(shortId, _nodeId, 5);
+  shortId[5] = '\0';
+  snprintf(_pubTopic, sizeof(_pubTopic), "%s", shortId);
+  snprintf(_subTopic, sizeof(_subTopic), "%s/sub", shortId);
 
   // MQTT credentials
   snprintf(_mqttBroker, sizeof(_mqttBroker), "%s", mqtt_server);
@@ -234,7 +237,7 @@ bool Sim7070GDevice::ensureMqttReady()
     const char *pass = _mqttPassword[0] ? _mqttPassword : nullptr;
 
     if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort,
-                               user, pass, MQTT_KEEPALIVE_SEC, true))
+                               user, pass, MQTT_KEEPALIVE_SEC, _subTopic, _pubTopic, 0, false, false, false, true))
     {
       return false;
     }
@@ -766,7 +769,7 @@ int Sim7070GDevice::timeout()
     DEBUG_PRINTLN(F("[SIM7070G] Synchronizing NTP time..."));
 
     // Try to sync NTP time with multiple servers
-    bool ntpSuccess = _modem->syncTimeUTC_any(PDP_CID*4, 12000);
+    bool ntpSuccess = _modem->syncTimeUTC_any(PDP_CID * 4, 12000);
 
     if (ntpSuccess)
     {
@@ -828,16 +831,11 @@ int Sim7070GDevice::timeout()
     DEBUG_PRINTLN(F("[SIM7070G] Clean session: "));
     DEBUG_PRINTLN(true);
 
-    if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort, _mqttUsername, _mqttPassword, MQTT_KEEPALIVE_SEC, true))
+    if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort, _mqttUsername, _mqttPassword, MQTT_KEEPALIVE_SEC, _subTopic, "Power on", 0, true, false, true, true))
     {
       DEBUG_PRINTLN(F("[SIM7070G] Failed to set MQTT config"));
-      // updateState(MODEM_ERROR);
       return 20000;
     }
-    DEBUG_PRINTLN(F("[SIM7070G] Connecting to MQTT"));
-    _modem->sendCommandSync("AT+SMCONF?", 5000);
-    updateState(MODEM_MQTT_CONNECTING);
-    return 2000;
   }
   case MODEM_MQTT_CONNECTING:
   {
@@ -873,52 +871,57 @@ int Sim7070GDevice::timeout()
     if (_modem)
     {
       _modem->loop();
+    }
 
-      // Subscribe to topic
-      if (_modem->mqttSubscribe(_subTopic, 0))
+    // Subscribe to topic
+    if (_modem->mqttSubscribe(_subTopic, 0))
+    {
+      DEBUG_PRINTLN(F("[SIM7070G] Subscribed to MQTT topic successfully"));
+      // Success, reset retry count
+      _retryCount = 0;
+
+      // Publish online status
+      char msg[160];
+      snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
+      enqueueTelemetry(msg);
+
+      _lastHeartbeatMs = millis();
+      updateState(MODEM_MQTT_CONNECTED);
+      return 200;
+    }
+    else
+    {
+      char cmd[256];
+      snprintf(cmd, sizeof(cmd), "AT+SMUNSUB=\"%s\"", _subTopic);
+      if (!_modem->checkSendCommandSync(cmd, "OK", 100))
       {
-        DEBUG_PRINTLN(F("[SIM7070G] Subscribed to MQTT topic successfully"));
-        // Success, reset retry count
+        DEBUG_PRINTLN(F("[SIM7070G] Failed to unsubscribe from MQTT topic"));
+      }
+      _retryCount++;
+      DEBUG_PRINT(F("[SIM7070G] Failed to subscribe to MQTT topic (attempt "));
+      DEBUG_PRINT(_retryCount);
+      DEBUG_PRINTLN(F(")"));
+
+      if (_retryCount >= 5)
+      {
+        DEBUG_PRINTLN(F("[SIM7070G] Subscribe failed after 5 attempts, closing and reinitializing MQTT..."));
+        // Close MQTT connection
+        if (_modem->isMQTTConnected())
+        {
+          _modem->mqttDisconnect();
+          DEBUG_PRINTLN(F("[SIM7070G] MQTT connection closed"));
+        }
+        // Reset MQTT to reinitialize
+        _mqttBegun = false;
         _retryCount = 0;
-
-
-        // Publish online status
-        char msg[160];
-        snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
-        enqueueTelemetry(msg);
-
-        _lastHeartbeatMs = millis();
-        updateState(MODEM_MQTT_CONNECTED);
-        return 200;
+        // Reinitialize MQTT
+        updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
+        return DURATION_IMMEDIATELY;
       }
       else
       {
-        _retryCount++;
-        DEBUG_PRINT(F("[SIM7070G] Failed to subscribe to MQTT topic (attempt "));
-        DEBUG_PRINT(_retryCount);
-        DEBUG_PRINTLN(F(")"));
-
-        if (_retryCount >= 5)
-        {
-          DEBUG_PRINTLN(F("[SIM7070G] Subscribe failed after 5 attempts, closing and reinitializing MQTT..."));
-          // Close MQTT connection
-          if (_modem->isMQTTConnected())
-          {
-            _modem->mqttDisconnect();
-            DEBUG_PRINTLN(F("[SIM7070G] MQTT connection closed"));
-          }
-          // Reset MQTT to reinitialize
-          _mqttBegun = false;
-          _retryCount = 0;
-          // Reinitialize MQTT
-          updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
-          return DURATION_IMMEDIATELY;
-        }
-        else
-        {
-          // Retry subscribe after 10 seconds
-          return 10000;
-        }
+        // Retry subscribe after 10 seconds
+        return 10000;
       }
     }
 
@@ -942,7 +945,7 @@ int Sim7070GDevice::timeout()
       updateState(next);
       return DURATION_IMMEDIATELY;
     }
-    const unsigned long WAITING_SUCCESS_TIMEOUT_MS = 5UL * 60 * 1000; 
+    const unsigned long WAITING_SUCCESS_TIMEOUT_MS = 30 * 1000;
     if ((millis() - _stateStartTime) >= WAITING_SUCCESS_TIMEOUT_MS)
     {
       DEBUG_PRINTLN(F("[SIM7070G] Waiting success timeout (5 min), transitioning to MQTT connected"));
@@ -1188,7 +1191,8 @@ bool Sim7070GDevice::flushMessageBuffer()
     if (_state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected())
     {
       DEBUG_PRINTLN(F("[SIM7070G] Publishing message: "));
-      updateState(MODEM_WAITING_SUCCESS);
+      // updateState(MODEM_WAITING_SUCCESS);
+      updateState(MODEM_MQTT_CONNECTED);
       // msg.payload is char[], so it's compatible with mqttPublish
       msg.length = strlen(msg.payload);
       if (_modem->mqttPublish(msg.topic, msg.payload, msg.qos, false))

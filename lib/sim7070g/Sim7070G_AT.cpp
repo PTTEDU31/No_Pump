@@ -85,7 +85,10 @@ int Sim7070G_AT::sendCommand(const char* command, unsigned long timeout,
     return -1;
   }
   
-  ATCommand* cmd = &_commandQueue[_queueHead];
+  // Lưu chỉ mục trước khi increment để tránh lỗi modulo wrap-around
+  uint8_t cmdIndex = _queueHead;
+  
+  ATCommand* cmd = &_commandQueue[cmdIndex];
   strncpy(cmd->command, command, sizeof(cmd->command) - 1);
   cmd->command[sizeof(cmd->command) - 1] = '\0';
   cmd->timeout = timeout;
@@ -104,7 +107,7 @@ int Sim7070G_AT::sendCommand(const char* command, unsigned long timeout,
     sendNextCommand();
   }
   
-  return _queueHead - 1;
+  return cmdIndex;
 }
 
 bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout, 
@@ -116,10 +119,9 @@ bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout,
   bool result = false;
   unsigned long startTime = millis();
   
-  // Send command - get the command that was just queued
-  // The command is at _queueHead - 1 (before increment)
-  uint8_t cmdIndex = _queueHead;
-  if (sendCommand(command, timeout, nullptr, nullptr) < 0) {
+  // Send command - sử dụng return value để lấy đúng chỉ mục command
+  int cmdIndex = sendCommand(command, timeout, nullptr, nullptr);
+  if (cmdIndex < 0) {
     return false;
   }
   
@@ -135,9 +137,15 @@ bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout,
       // Command completed
       if (sentCmd->responseType == ATResponseType::OK) {
         result = true;
-        if (response && responseSize > 0 && sentCmd->response[0] != '\0') {
-          strncpy(response, sentCmd->response, responseSize - 1);
-          response[responseSize - 1] = '\0';
+        // Copy response (including ">" prompt)
+        if (response && responseSize > 0) {
+          if (sentCmd->response[0] != '\0') {
+            strncpy(response, sentCmd->response, responseSize - 1);
+            response[responseSize - 1] = '\0';
+          } else {
+            // Clear response buffer if empty
+            response[0] = '\0';
+          }
         }
       }
       break;
@@ -203,16 +211,6 @@ void Sim7070G_AT::processResponse() {
           }
         }
         
-        // Check if current command is a query command (ends with ?)
-        bool isQueryCommand = false;
-        if (_currentCommand && _currentCommand->waiting) {
-          const char* cmd = _currentCommand->command;
-          size_t cmdLen = strlen(cmd);
-          if (cmdLen > 0 && cmd[cmdLen - 1] == '?') {
-            isQueryCommand = true;
-          }
-        }
-        
         // Step 2: Handle DATA lines (start with +)
         if (_responseBuffer[0] == '+') {
           // If there's a command waiting, treat + lines as DATA response, not URC
@@ -241,11 +239,18 @@ void Sim7070G_AT::processResponse() {
           if (type == ATResponseType::OK || type == ATResponseType::ERROR) {
             if (_currentCommand && _currentCommand->waiting) {
               // Use accumulated response if available, otherwise use current line
-              const char* finalResponse = _responseBuffer;
+              const char* finalResponse = "";
               if (_currentCommand->response[0] != '\0') {
                 finalResponse = _currentCommand->response;
+              } else {
+                // For OK (including ">" prompt) or ERROR, use the response line
+                finalResponse = _responseBuffer;
               }
               completeCommand(type, finalResponse);
+            } else {
+              // No command waiting but got OK/ERROR - might be unsolicited, log it
+              DEBUG_PRINT(F("[AT] Unsolicited response: "));
+              DEBUG_PRINTLN(_responseBuffer);
             }
           } else if (type == ATResponseType::DATA) {
             // Other data lines (not starting with +) - append to response buffer
@@ -292,6 +297,12 @@ ATResponseType Sim7070G_AT::parseResponse(const char* line) {
   if (strcmp(line, "ERROR") == 0 || strncmp(line, "+CME ERROR:", 11) == 0 || 
       strncmp(line, "+CMS ERROR:", 11) == 0) {
     return ATResponseType::ERROR;
+  }
+  
+  // Check for ">" prompt (data input prompt)
+  // Modem sends ">" or "> " (with space) to indicate ready for data input
+  if (line[0] == '>' && (line[1] == '\0' || line[1] == ' ' || line[1] == '\r')) {
+    return ATResponseType::OK; // Treat ">" as successful response
   }
   
   // Check for URC (starts with +)
