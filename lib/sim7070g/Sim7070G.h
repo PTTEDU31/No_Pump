@@ -13,6 +13,9 @@ enum class Sim7070GState {
   CONNECTING_NETWORK,
   NETWORK_CONNECTED,
   NETWORK_DISCONNECTED,
+  MQTT_CONNECTING,
+  MQTT_CONNECTED,
+  MQTT_DISCONNECTED,
   ERROR
 };
 
@@ -266,6 +269,7 @@ private:
   static void onURC_CGNAPN(const char* urc, const char* data);
   static void onURC_CNACT(const char* urc, const char* data);
   static void onURC_APP_PDP(const char* urc, const char* data);
+  static void onURC_SMCONN(const char* urc, const char* data);
   
   // Static instance for URC callbacks
   static Sim7070G* _instance;

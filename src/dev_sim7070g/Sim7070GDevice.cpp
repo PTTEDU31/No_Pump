@@ -53,6 +53,35 @@ void Sim7070GDevice::onNetworkStateChanged(Sim7070GState state)
   }
 }
 
+void Sim7070GDevice::mqttStateThunk(MQTTState state)
+{
+  if (s_instance)
+    s_instance->onMqttStateChanged(state);
+}
+
+void Sim7070GDevice::onMqttStateChanged(MQTTState state)
+{
+  switch (state)
+  {
+  case MQTTState::DISCONNECTED:
+    DEBUG_PRINTLN(F("[SIM7070G] MQTT state: DISCONNECTED"));
+    updateState(MODEM_ERROR);
+    break;
+  case MQTTState::CONNECTING:
+    DEBUG_PRINTLN(F("[SIM7070G] MQTT state: CONNECTING"));
+    break;
+  case MQTTState::CONNECTED:
+    DEBUG_PRINTLN(F("[SIM7070G] MQTT state: CONNECTED"));
+    break;
+  case MQTTState::DISCONNECTING:
+    DEBUG_PRINTLN(F("[SIM7070G] MQTT state: DISCONNECTING"));
+    break;
+  case MQTTState::ERROR:
+    DEBUG_PRINTLN(F("[SIM7070G] MQTT state: ERROR"));
+    break;
+  }
+}
+
 // Constructor
 Sim7070GDevice::Sim7070GDevice(HardwareSerial *modemSerial, const char *nodeId)
     : Device(EVENT_NONE, 0), // No event subscription, run on core 0
@@ -132,6 +161,8 @@ bool Sim7070GDevice::initialize()
   _modem->setMQTTMessageCallback(&Sim7070GDevice::mqttMessageThunk);
   // Set network state callback (URC +APP PDP: DEACTIVE -> MODEM_ERROR when in GPRS-dependent state)
   _modem->setNetworkStateCallback(&Sim7070GDevice::networkStateThunk);
+  // Set MQTT state callback (CONNECTING, CONNECTED, DISCONNECTED, etc.)
+  _modem->setMQTTStateCallback(&Sim7070GDevice::mqttStateThunk);
 
   updateState(MODEM_OFF);
   return true;
@@ -160,14 +191,14 @@ int Sim7070GDevice::start()
 
   // APN
   snprintf(_apn, sizeof(_apn), "%s", PDP_APN);
-  _gprsUser[0] = '\0';
-  _gprsPass[0] = '\0';
+  snprintf(_gprsUser, sizeof(_gprsUser), "%s", USERNAME_APN ? USERNAME_APN : "");
+  snprintf(_gprsPass, sizeof(_gprsPass), "%s", PASSWORD_APN ? PASSWORD_APN : "");
 
   _mqttBegun = false;
   _lastHeartbeatMs = 0;
 
   // Start by powering on modem
-  updateState(MODEM_POWER_ON);
+  updateState(MODEM_RESET);
   return DURATION_IMMEDIATELY;
 }
 
@@ -535,9 +566,13 @@ int Sim7070GDevice::timeout()
     }
     DEBUG_PRINTLN(F("[SIM7070G] Resetting modem..."));
     digitalWrite(MODEM_POWER_PIN, LOW);
+    delay(1500);
+    digitalWrite(MODEM_POWER_PIN, HIGH);
+    delay(2000);
+    digitalWrite(MODEM_POWER_PIN, LOW);
+    delay(200);
     updateState(MODEM_POWER_ON);
-
-    return 1700;
+    return 7000;
   }
   case MODEM_POWER_ON:
   {
@@ -724,6 +759,9 @@ int Sim7070GDevice::timeout()
     }
     DEBUG_PRINT(F("[SIM7070G] Set APN: "));
     DEBUG_PRINTLN(_apn);
+    _modem->checkSendCommandSync("AT+CNACT=0,0", "OK", 5000);
+    _modem->checkSendCommandSync("AT+CNACT=1,0", "OK", 5000);
+
     if (_modem->setAPN(1, _apn, _gprsUser[0] ? _gprsUser : nullptr, _gprsPass[0] ? _gprsPass : nullptr))
     {
       DEBUG_PRINTLN(F("[SIM7070G] Set APN success"));

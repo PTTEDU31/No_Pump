@@ -91,7 +91,9 @@ private:
   static Sim7070GDevice* s_instance;
   static void mqttMessageThunk(const char* topic, const uint8_t* payload, uint32_t len);
   static void networkStateThunk(Sim7070GState state);
+  static void mqttStateThunk(MQTTState state);
   void onNetworkStateChanged(Sim7070GState state);
+  void onMqttStateChanged(MQTTState state);
 
   HardwareSerial* _modemSerial;
   Sim7070G* _modem;

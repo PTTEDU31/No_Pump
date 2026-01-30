@@ -69,6 +69,7 @@ bool Sim7070G::begin()
   _at.registerURCHandler("+CGNAPN", onURC_CGNAPN);
   _at.registerURCHandler("+CNACT", onURC_CNACT);
   _at.registerURCHandler("+APP PDP", onURC_APP_PDP);
+  _at.registerURCHandler("+SMCONN", onURC_SMCONN);
 
   updateState(Sim7070GState::INITIALIZING);
 
@@ -795,19 +796,31 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
   // AT+SMPUB=<topic>,<length>,<qos>,<retain>
   // Modem responds with ">" then expects payload
   char cmd[256];
+  char response[32];
   size_t payloadLen = strlen(payload);
   snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, payloadLen, qos, retain ? 1 : 0);
   DEBUG_PRINTLN(F("[SMPUB] Command: "));
   DEBUG_PRINTLN(cmd);
-  if (!checkSendCommandSync(cmd, ">", 500))
+  if (!sendCommandSync(cmd, 500, response, 32));
+  DEBUG_PRINT("Response HEX: ");
+  for (size_t i = 0; i < strlen(response); i++) {
+    DEBUG_PRINT(String(response[i], HEX));
+    DEBUG_PRINT(" ");
+  }
+  DEBUG_PRINTLN("Sending payload...");
+  if(response[0] == 0x0b)
   {
-    DEBUG_PRINTLN(F("[SMPUB] Failed to send command (no '>' prompt)"));
+    DEBUG_PRINTLN("Payload sending...");
+  }
+  else
+  {
+    DEBUG_PRINTLN("Payload can not be sent");
+    return false;
   }
 
-  //
   _serial->write(payload, payloadLen);
   _serial->flush();
-  checkSendCommandSync("", "OK", 5000);
+  // checkSendCommandSync("", "OK", 5000);
   return true;
 }
 
@@ -1497,6 +1510,23 @@ void Sim7070G::onURC_APP_PDP(const char *urc, const char *data)
     }
   }
 }
+
+void Sim7070G::onURC_SMCONN(const char *urc, const char *data)
+{
+  DEBUG_PRINTLN(F("[URC] SMCONN: "));
+  DEBUG_PRINTLN(data);
+  if (strcmp(data, "1") == 0)
+  {
+    DEBUG_PRINTLN(F("[URC] SMCONN: OK"));
+    _instance->updateMQTTState(MQTTState::CONNECTED);
+  }
+  else
+  {
+    DEBUG_PRINTLN(F("[URC] SMCONN: Failed"));
+    _instance->updateMQTTState(MQTTState::DISCONNECTED);
+  }
+}
+
 
 // Command wrappers - expose Sim7070G_AT methods
 bool Sim7070G::sendCommandSync(const char *command, unsigned long timeout,

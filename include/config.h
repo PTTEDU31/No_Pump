@@ -53,7 +53,9 @@ extern const char* CRYPTOKEY;
 // #define PDP_CID 7
 #define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
-#define PDP_APN "m3-world"
+#define PDP_APN "v-internet"
+#define USERNAME_APN ""
+#define PASSWORD_APN ""
 
 // Network Mode Selection: 0 = GPRS (Cat-M1/2G), 1 = NB-IoT
 // Change this to switch between GPRS and NB-IoT modes
