@@ -4,27 +4,14 @@
 
 #include <Arduino.h>
 #include "device.h"
+#include "config.h"
 
-// Configuration
-#define METER_ADDRESS 0x01
-#define METER_FUNCTION_CODE 0x03
-#define METER_NUM_REGISTERS 0x0002
-
-// Register addresses (32-bit format used in original code)
-#define METER_CURRENT_ADDRESS 0x00000002
-#define METER_CUMULATIVE_ADDRESS 0x00380002
-
-// History storage configuration
-#define MAX_HISTORY_SIZE 60  // Store last 60 readings (15 min at 15s interval)
-
-// Default read interval
-#define WATER_METER_READ_INTERVAL_MS 15000  // 15 seconds
 
 // Data structure for a single reading
 struct WaterMeterReading {
   unsigned long timestamp;  // millis() when reading was taken
-  float currentFlow;        // m³/h
-  float cumulativeFlow;     // m³
+  float currentFlow;        // m³/s (Instantaneous flow rate)
+  float cumulativeFlow;     // m³ (Cumulative flow)
   bool valid;               // Reading validity flag
 };
 
@@ -101,15 +88,19 @@ private:
   // Last read timestamp
   unsigned long _lastReadTime;
   
-  // Reading state: 0 = read current flow, 1 = read cumulative flow
+  // Reading state: 0 = read flow unit, 1 = read flow rate, 2 = read cumulative flow
   uint8_t _readingState;
+  uint8_t _flowUnit;  // Flow unit (0-8) from register 0x0006
   
   // Internal methods
   bool readParameter(uint32_t regAddr, float& value);
-  void sendModbusRequest(uint32_t regAddr);
-  bool parseModbusResponse(uint32_t& rawValue);
+  bool readUint16Parameter(uint32_t regAddr, uint16_t& value);
+  void sendModbusRequest(uint32_t regAddr, uint16_t numRegisters = METER_NUM_REGISTERS);
+  bool parseModbusResponse(float& floatValue, bool isFloatInverse);
+  bool parseModbusResponseUint16(uint16_t& value);
   uint16_t calculateCRC(uint8_t* buffer, uint16_t length);
-  float scaleValue(uint32_t rawValue, uint32_t regAddr);
+  float parseFloatInverse(uint8_t* data);  // Parse IEEE754 float with inverse byte order
+  float convertToM3PerSecond(float value, uint8_t flowUnit);  // Convert to m³/s based on flow unit
   void addToHistory(const WaterMeterReading& reading);
   
   // Modbus frame buffer

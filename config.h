@@ -28,17 +28,30 @@ extern const char* CRYPTOKEY;
 
 #define RS485_RX_PIN 5  // PIN RX for RS485 module
 #define RS485_TX_PIN 6  // PIN TX for RS485 module
-
 // =========================================================================
 // MODBUS ADDRESSES
 // =========================================================================
-#define METER_CURRENT_ADDRESS 0x00000002      // Constant water flow address
-#define METER_CUMULATIVE_ADDRESS 0x00380002   // Cumulative water flow address
+// Configuration
+#define METER_ADDRESS 0x01
+#define METER_FUNCTION_CODE 0x04  // Function code 04 for reading variable data (Input Registers)
+#define METER_NUM_REGISTERS 0x0002
+
+// Register addresses according to L-MAG-BM protocol
+#define METER_FLOW_UNIT_ADDRESS 0x0006     // Flow unit (0-8): 0=none, 1=m³/s, 2=m³/min, 3=m³/h, 4=m³/d, 5=m³/h, 6=L/s, 7=L/min, 8=L/h
+#define METER_FLOW_RATE_ADDRESS 0x0005     // Flow rate (in unit specified by flow unit register)
+#define METER_CUMULATIVE_ADDRESS 0x000A    // Flow total (cumulative flow) - in unit specified by flow total unit register
+
+// History storage configuration
+#define MAX_HISTORY_SIZE 60  // Store last 60 readings (15 min at 15s interval)
+
+// Default read interval
+#define WATER_METER_READ_INTERVAL_MS 15000  // 15 seconds
 
 // =========================================================================
 // PDP CONTEXT (GPRS/NB-IoT)
 // =========================================================================
-#define PDP_CID 7
+// #define PDP_CID 7
+#define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
 #define PDP_APN "m3-world"
 
@@ -49,7 +62,7 @@ extern const char* CRYPTOKEY;
 // =========================================================================
 // WATCHDOG
 // =========================================================================
-#define HW_WDT_TIMEOUT_SEC 16
+#define HW_WDT_TIMEOUT_SEC 120
 
 // =========================================================================
 // MQTT CONFIGURATION
@@ -62,8 +75,8 @@ extern const int mqtt_port;
 // =========================================================================
 #define BAT_THRESH_PCT 90              // Battery percentage threshold that changes publication times
 #define BAT_HYST_PCT 3                 // Hysteresis to change publication time (this avoids jumping configuration)
-#define PUB_FAST_MS 15000UL            // Fast publication (when above battery threshold)
-#define PUB_SLOW_MS 30000UL            // Slow publication (when below battery threshold)
+#define PUB_FAST_MS 60000UL            // Fast publication (when above battery threshold)
+#define PUB_SLOW_MS 150000UL            // Slow publication (when below battery threshold)
 
 // =========================================================================
 // TIMING CONSTANTS
@@ -112,5 +125,20 @@ extern const int mqtt_port;
 #define READ_RESPONSE_WAIT_MS 300
 #define SIM_WAIT_MS 1000
 #define ON_PULSE_MS 5000
+
+
+// SIM7070G Configuration
+#define MODEM_BAUD_RATE 19200
+#define MODEM_POWER_PIN 12
+
+// Network configuration
+#define PDP_CONTEXT_ID PDP_CID // 0 is the default context
+#define APN_NAME PDP_APN
+
+// MQTT Configuration
+#define MQTT_MAX_RECONNECT_ATTEMPTS 3
+#define MQTT_KEEPALIVE_SEC 60
+#define MQTT_BUFFER_SIZE 10  // Maximum number of messages to buffer
+
 
 #endif // CONFIG_H
