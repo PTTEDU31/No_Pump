@@ -85,7 +85,7 @@ int Sim7070G_AT::sendCommand(const char* command, unsigned long timeout,
     return -1;
   }
   
-  // Lưu chỉ mục trước khi increment để tránh lỗi modulo wrap-around
+  // Save index before increment to avoid modulo wrap-around error
   uint8_t cmdIndex = _queueHead;
   
   ATCommand* cmd = &_commandQueue[cmdIndex];
@@ -119,7 +119,7 @@ bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout,
   bool result = false;
   unsigned long startTime = millis();
   
-  // Send command - sử dụng return value để lấy đúng chỉ mục command
+  // Send command - use return value to get correct command index
   int cmdIndex = sendCommand(command, timeout, nullptr, nullptr);
   if (cmdIndex < 0) {
     return false;

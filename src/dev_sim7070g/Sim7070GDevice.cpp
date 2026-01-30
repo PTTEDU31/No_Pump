@@ -14,6 +14,45 @@ void Sim7070GDevice::mqttMessageThunk(const char *topic, const uint8_t *payload,
   }
 }
 
+void Sim7070GDevice::networkStateThunk(Sim7070GState state)
+{
+  if (s_instance)
+  {
+    s_instance->onNetworkStateChanged(state);
+  }
+}
+
+void Sim7070GDevice::onNetworkStateChanged(Sim7070GState state)
+{
+  if (state != Sim7070GState::NETWORK_DISCONNECTED)
+    return;
+
+  // URC "+APP PDP: 0,DEACTIVE" received - PDP context deactivated
+  // If we're in a GPRS-dependent state, transition to MODEM_ERROR for recovery
+  switch (_state)
+  {
+  case MODEM_ACTIVATE_CNACT_FIRST:
+  case MODEM_WAIT_FOR_IP_FIRST:
+  case MODEM_CHECK_IP_FIRST:
+  case MODEM_APPLY_BOOT_CONFIG:
+  case MODEM_CHECK_SIM_AFTER_CONFIG:
+  case MODEM_CHECK_SIGNAL_AFTER_CONFIG:
+  case MODEM_SET_APN:
+  case MODEM_WAIT_FOR_IP_AFTER_APN:
+  case MODEM_CHECK_IP_AFTER_APN:
+  case MODEM_SYNC_NTP_TIME:
+  case MODEM_MQTT_CONNECTING_HANDSHAKE:
+  case MODEM_MQTT_CONNECTING:
+  case MODEM_MQTT_CONNECTED_FIRST:
+  case MODEM_MQTT_CONNECTED:
+    DEBUG_PRINTLN(F("[SIM7070G] PDP context deactivated (URC) -> MODEM_ERROR"));
+    updateState(MODEM_ERROR);
+    break;
+  default:
+    break;
+  }
+}
+
 // Constructor
 Sim7070GDevice::Sim7070GDevice(HardwareSerial *modemSerial, const char *nodeId)
     : Device(EVENT_NONE, 0), // No event subscription, run on core 0
@@ -91,6 +130,8 @@ bool Sim7070GDevice::initialize()
 
   // Set MQTT message callback
   _modem->setMQTTMessageCallback(&Sim7070GDevice::mqttMessageThunk);
+  // Set network state callback (URC +APP PDP: DEACTIVE -> MODEM_ERROR when in GPRS-dependent state)
+  _modem->setNetworkStateCallback(&Sim7070GDevice::networkStateThunk);
 
   updateState(MODEM_OFF);
   return true;
@@ -102,16 +143,18 @@ int Sim7070GDevice::start()
   DEBUG_PRINTLN(F("[SIM7070G] Starting modem..."));
 
   // MQTT topics - use first 5 characters of nodeId
-  char shortId[6];
-  strncpy(shortId, _nodeId, 5);
-  shortId[5] = '\0';
-  snprintf(_pubTopic, sizeof(_pubTopic), "%s", shortId);
-  snprintf(_subTopic, sizeof(_subTopic), "%s/sub", shortId);
+  // char shortId[6];
+  // strncpy(shortId, _nodeId, 5);
+  // shortId[5] = '\0';
+  snprintf(_pubTopic, sizeof(_pubTopic), "xtr/server/%s", _nodeId);
+  snprintf(_subTopic, sizeof(_subTopic), "xtr/nodes/%s", _nodeId);
 
+  // snprintf(_pubTopic, sizeof(_pubTopic), "%s", _nodeId);
+  // snprintf(_subTopic, sizeof(_subTopic), "sub/%s", _nodeId);
   // MQTT credentials
   snprintf(_mqttBroker, sizeof(_mqttBroker), "%s", mqtt_server);
   _mqttPort = (uint16_t)mqtt_port;
-  snprintf(_mqttClientId, sizeof(_mqttClientId), "nono_%s", _nodeId);
+  snprintf(_mqttClientId, sizeof(_mqttClientId), "%s", _nodeId);
   snprintf(_mqttUsername, sizeof(_mqttUsername), "%s", USERNAME ? USERNAME : "");
   snprintf(_mqttPassword, sizeof(_mqttPassword), "%s", PASSWORD ? PASSWORD : "");
 
@@ -831,11 +874,21 @@ int Sim7070GDevice::timeout()
     DEBUG_PRINTLN(F("[SIM7070G] Clean session: "));
     DEBUG_PRINTLN(true);
 
-    if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort, _mqttUsername, _mqttPassword, MQTT_KEEPALIVE_SEC, _subTopic, "Power on", 0, true, false, true, true))
+    if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort, _mqttUsername, _mqttPassword, MQTT_KEEPALIVE_SEC, _subTopic, "Power on", 1, true, false, true, true))
     {
-      DEBUG_PRINTLN(F("[SIM7070G] Failed to set MQTT config"));
+      _retryCount++;
+      DEBUG_PRINT(F("[SIM7070G] Failed to set MQTT config (retry "));
+      DEBUG_PRINT(_retryCount);
+      DEBUG_PRINTLN(F("/3)"));
+      if (_retryCount >= 3)
+      {
+        DEBUG_PRINTLN(F("[SIM7070G] MQTT config failed 3 times -> MODEM_ERROR"));
+        updateState(MODEM_ERROR);
+        return 5000;
+      }
       return 20000;
     }
+    _retryCount = 0;  // Reset on success
   }
   case MODEM_MQTT_CONNECTING:
   {
@@ -860,7 +913,11 @@ int Sim7070GDevice::timeout()
     }
     else
     {
-      _modem->checkSendCommandSync("AT+SMDISC", "OK", 60000);
+      
+      if(!_modem->checkSendCommandSync("AT+SMDISC", "OK", 15000)){
+        DEBUG_PRINTLN(F("[SIM7070G] MQTT disconnect failed, retrying..."));
+        powerPulse();    
+      }
       DEBUG_PRINTLN(F("[SIM7070G] MQTT connect failed, disconnecting and retrying..."));
       return 30000;
     }
@@ -1209,6 +1266,8 @@ bool Sim7070GDevice::flushMessageBuffer()
     }
     else
     {
+      DEBUG_PRINTLN(F("[SIM7070G] Not connected to MQTT, dropping message"));
+      updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
       failCount++;
       enqueueMessage(msg.topic, msg.payload, msg.qos);
       break;

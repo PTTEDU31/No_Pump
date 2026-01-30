@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include "device.h"
-#include <Sim7070G.h>
+#include "Sim7070G.h"
 
 #include "config.h"
 // Connection states
@@ -90,6 +90,8 @@ public:
 private:
   static Sim7070GDevice* s_instance;
   static void mqttMessageThunk(const char* topic, const uint8_t* payload, uint32_t len);
+  static void networkStateThunk(Sim7070GState state);
+  void onNetworkStateChanged(Sim7070GState state);
 
   HardwareSerial* _modemSerial;
   Sim7070G* _modem;

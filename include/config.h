@@ -50,7 +50,8 @@ extern const char* CRYPTOKEY;
 // =========================================================================
 // PDP CONTEXT (GPRS/NB-IoT)
 // =========================================================================
-#define PDP_CID 7
+// #define PDP_CID 7
+#define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
 #define PDP_APN "m3-world"
 

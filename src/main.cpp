@@ -116,7 +116,7 @@ PumpDevice pump(CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN);
 
 // Export pump device reference for Sim7070GDevice
 PumpDevice *g_pumpDevice = &pump;
-LSM6DS3Device lsm6ds3;  // Đọc mỗi 15 giây
+LSM6DS3Device lsm6ds3;  // Read every 15 seconds
 // ----------------- PROTOTYPES -----------------
 void turnOnPump();
 void turnOffPump();
@@ -178,7 +178,7 @@ Device *devices[] = {
     &waterMeter,
     &modem,
     &pump,
-    &lsm6ds3,
+    // &lsm6ds3,
 };
 
 // ----------------- SETUP -----------------

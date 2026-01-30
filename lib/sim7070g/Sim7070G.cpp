@@ -804,7 +804,7 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
     DEBUG_PRINTLN(F("[SMPUB] Failed to send command (no '>' prompt)"));
   }
 
-  // Send payload after ">" prompt
+  //
   _serial->write(payload, payloadLen);
   _serial->flush();
   checkSendCommandSync("", "OK", 5000);
@@ -1317,7 +1317,7 @@ void Sim7070G::onURC_SMSTATE(const char *urc, const char *data)
   switch (state)
   {
   case 0:
-    // +SMSTATE: 0 – modem báo MQTT đã ngắt kết nối
+    // +SMSTATE: 0 - modem reports MQTT disconnected
     mqttState = MQTTState::DISCONNECTED;
     DEBUG_PRINTLN(F("[URC] +SMSTATE: 0 (MQTT disconnected)"));
     break;
@@ -1534,6 +1534,9 @@ bool Sim7070G::checkSendCommandSync(const char *command, const char *expectedRes
   char *responsePtr = response;
   DEBUG_PRINTLN(F("[CMD] Response: "));
   DEBUG_PRINTLN(response);
+  for (int i = 0; i < strlen(response); i++) {
+    printf("%02X ", responsePtr[i]);
+}
   if (strncmp(responsePtr, command, strlen(command)) == 0)
   {
     // Skip echo line

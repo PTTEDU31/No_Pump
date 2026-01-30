@@ -1,15 +1,15 @@
 /*
  * SIM7070G Library - Basic Example
  * 
- * Ví dụ cơ bản về cách sử dụng thư viện SIM7070G bất đồng bộ
+ * Basic example of how to use the SIM7070G asynchronous library
  */
 
 #include <Sim7070G.h>
 
-// Serial port cho modem (thay đổi theo board của bạn)
+// Serial port for modem (change according to your board)
 HardwareSerial* modemSerial = &Serial1;
 
-// Tạo instance của SIM7070G
+// Create instance of SIM7070G
 // Parameters: serial, powerPin, baudRate
 Sim7070G modem(modemSerial, 12, 19200);
 
@@ -110,7 +110,7 @@ void setup() {
 }
 
 void loop() {
-  // CRITICAL: Phải gọi loop() thường xuyên để xử lý các operations bất đồng bộ
+  // CRITICAL: Must call loop() frequently to process asynchronous operations
   modem.loop();
   
   // Your code here
