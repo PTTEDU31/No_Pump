@@ -192,6 +192,10 @@ void setup()
   Serial.begin(115200);
   DEBUG_PRINTLN(F("Starting initialization..."));
 
+  // Initialize temperature sensor
+  tempSAMD.init();
+  DEBUG_PRINTLN(F("[TEMP] Temperature sensor initialized"));
+
   // Register devices with DeviceManager
   DeviceManager::getInstance().registerDevices(devices, sizeof(devices) / sizeof(devices[0]));
   DEBUG_PRINTLN(F("[DEVICE] Devices registered"));
@@ -456,17 +460,29 @@ bool publishTelemetry()
   bool haveTs = modem.getModem() && modem.getModem()->getNetworkTimeISO8601(tsZ, sizeof(tsZ));
 
   char plain[420];
+  
+  // Prepare FLOW and TOT strings (either numeric value or "null")
+  char flowStr[20];
+  char totStr[20];
+  if (sensorData.waterMeterValid) {
+    snprintf(flowStr, sizeof(flowStr), "%.6f", FLOW);
+    snprintf(totStr, sizeof(totStr), "%.3f", TOT);
+  } else {
+    strcpy(flowStr, "null");
+    strcpy(totStr, "null");
+  }
+  
   if (haveTs)
   {
     snprintf(plain, sizeof(plain),
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
              "\"TCPU\":%.1f,"
-             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"FLOW\":%s,\"TOT\":%s,"
              "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
              "\"PWR\":%d,\"AT_UTC\":\"%s\"}",
              V1, V2, V3, X, Prot, B, CSQ,
-             TCPU, FLOW, TOT,
+             (double)TCPU, flowStr, totStr,
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR, tsZ);
   }
@@ -476,11 +492,11 @@ bool publishTelemetry()
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
              "\"TCPU\":%.1f,"
-             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"FLOW\":%s,\"TOT\":%s,"
              "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
              "\"PWR\":%d,\"AT_UTC\":null}",
              V1, V2, V3, X, Prot, B, CSQ,
-             TCPU, FLOW, TOT,
+             (double)TCPU, flowStr, totStr,
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR);
   }
@@ -501,12 +517,9 @@ bool publishTelemetry()
 
   char hexPayload[1024];
   size_t o = 0;
-  hexEncode(nonce, 12, hexPayload + o, sizeof(hexPayload) - o, true);
-  o += 24;
-  hexEncode(ct, ctLen, hexPayload + o, sizeof(hexPayload) - o, true);
-  o += ctLen * 2;
-  hexEncode(tag, 16, hexPayload + o, sizeof(hexPayload) - o, true);
-  o += 32;
+  hexEncode(nonce, 12, hexPayload + o, sizeof(hexPayload) - o, true); o += 12 * 2;
+  hexEncode(ct, ctLen, hexPayload + o, sizeof(hexPayload) - o, true); o += ctLen * 2;
+  hexEncode(tag, 16, hexPayload + o, sizeof(hexPayload) - o, true);   o += 16 * 2;
   hexPayload[o] = '\0';
 
   // Push to MQTT buffer; modem will send automatically when connected
