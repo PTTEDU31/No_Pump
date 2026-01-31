@@ -1,0 +1,4 @@
+# Dependencies: mqtt_crypto.py (ChaCha20-Poly1305), mqtt_client.py (MQTT)
+# Cài: pip install -r requirements-mqtt-crypto.txt
+pycryptodome>=3.19.0
+paho-mqtt>=2.0.0

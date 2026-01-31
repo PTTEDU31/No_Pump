@@ -11,26 +11,19 @@
 #include "dev_sim7070g/Sim7070GDevice.h"
 #include "dev_pump/PumpDevice.h"
 #include "crypto_json_utils.h"
-#include "dev_lsm6ds3/LSM6DS3Device.h"
 
 ///////////////////////////////////////////////////////////////////////////
-// CREDENTIALS - Change these values from the portal
+// CREDENTIALS (defined in config.h as CONFIG_*)
 ///////////////////////////////////////////////////////////////////////////
-const char *NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-const char *USERNAME = "node_d935168a3a77";
-const char *PASSWORD = "G9XqOmsUYuSgq3mmWd0ecTmP";
-const char *CRYPTOKEY = "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F";
-// const char* NODE_ID = "5a06bafb-e479-4dc3-87d9-d79734d71f13";
-// const char* NODE_ID = "001";
-// const char* USERNAME = "";
-// const char* PASSWORD = "";
+const char* NODE_ID   = CONFIG_NODE_ID;
+const char* USERNAME  = CONFIG_USERNAME;
+const char* PASSWORD  = CONFIG_PASSWORD;
+const char* CRYPTOKEY = CONFIG_CRYPTOKEY;
 ///////////////////////////////////////////////////////////////////////////
 // MQTT SERVER
 ///////////////////////////////////////////////////////////////////////////
-// const char mqtt_server[] = "broker.remotextr.com";
-const char mqtt_server[] = "mqtt.myvpn.id.vn";
-
-const int mqtt_port = 1883;
+const char mqtt_server[] = CONFIG_MQTT_SERVER;
+const int mqtt_port = CONFIG_MQTT_PORT;
 
 ///////////////////////////////////////////////////////////////////////////
 // GLOBAL OBJECTS
@@ -116,7 +109,7 @@ PumpDevice pump(CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN);
 
 // Export pump device reference for Sim7070GDevice
 PumpDevice *g_pumpDevice = &pump;
-LSM6DS3Device lsm6ds3;  // Read every 15 seconds
+// LSM6DS3Device lsm6ds3;  // Read every 15 seconds
 // ----------------- PROTOTYPES -----------------
 void turnOnPump();
 void turnOffPump();
@@ -200,6 +193,8 @@ void setup()
   DeviceManager::getInstance().init();
   DEBUG_PRINTLN(F("[DEVICE] Devices initialized"));
 
+  tempSAMD.init();
+  DEBUG_PRINTLN(F("[TEMP] Temperature sensor initialized"));
   // Latch relay safety: if pump contact says OFF, pulse OFF to reset relay state
   latchRelaySafetySetup();
 
@@ -224,9 +219,11 @@ void loop()
   unsigned long now = millis();
   if ((unsigned long)(now - lastPublish) >= (unsigned long)publishIntervalMs)
   {
-    if (publishTelemetry())
-    {
-      lastPublish = now;
+    if(modem.checkMqttConnection()){
+      if (publishTelemetry())
+      {
+        lastPublish = now;
+      }
     }
   }
 }
@@ -454,7 +451,15 @@ bool publishTelemetry()
 
   char tsZ[21] = {0};
   bool haveTs = modem.getModem() && modem.getModem()->getNetworkTimeISO8601(tsZ, sizeof(tsZ));
-
+  char flowStr[20];
+  char totStr[20];
+  if (sensorData.waterMeterValid) {
+    snprintf(flowStr, sizeof(flowStr), "%.6f", FLOW);
+    snprintf(totStr, sizeof(totStr), "%.3f", TOT);
+  } else {
+    strcpy(flowStr, "null");
+    strcpy(totStr, "null");
+  }
   char plain[420];
   if (haveTs)
   {
@@ -462,11 +467,11 @@ bool publishTelemetry()
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
              "\"TCPU\":%.1f,"
-             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"FLOW\":%s,\"TOT\":%s,"
              "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
              "\"PWR\":%d,\"AT_UTC\":\"%s\"}",
              V1, V2, V3, X, Prot, B, CSQ,
-             TCPU, FLOW, TOT,
+             (double)TCPU, flowStr, totStr,
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR, tsZ);
   }
@@ -476,11 +481,11 @@ bool publishTelemetry()
              "{\"V1\":%d,\"V2\":%d,\"V3\":%d,"
              "\"X\":%d,\"P\":%d,\"B\":%d,\"CSQ\":%d,"
              "\"TCPU\":%.1f,"
-             "\"FLOW\":%.6f,\"TOT\":%.3f,"
+             "\"FLOW\":%s,\"TOT\":%s,"
              "\"RSIM\":%lu,\"RGPRS\":%lu,\"RMQTT\":%lu,"
              "\"PWR\":%d,\"AT_UTC\":null}",
              V1, V2, V3, X, Prot, B, CSQ,
-             TCPU, FLOW, TOT,
+             (double)TCPU, flowStr, totStr,
              (unsigned long)RSIM, (unsigned long)RGPRS, (unsigned long)RMQTT,
              PWR);
   }

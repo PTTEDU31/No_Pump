@@ -4,8 +4,15 @@
 #include <Arduino.h>
 
 // =========================================================================
-// NODE CREDENTIALS
+// NODE CREDENTIALS (change these values from the portal)
 // =========================================================================
+#define CONFIG_NODE_ID   "5a06bafb-e479-4dc3-87d9-d79734d71f13"
+#define CONFIG_USERNAME  "node_d935168a3a77"
+#define CONFIG_PASSWORD  "G9XqOmsUYuSgq3mmWd0ecTmP"
+#define CONFIG_CRYPTOKEY "B262DF3DCFCAEB149785BFDB3E84CF1535EF0F849FCB702449CD9A5DC037545F"
+// #define CONFIG_MQTT_SERVER "broker.remotextr.com"
+#define CONFIG_MQTT_SERVER "mqtt.myvpn.id.vn"
+#define CONFIG_MQTT_PORT 1883
 extern const char* NODE_ID;
 extern const char* USERNAME;
 extern const char* PASSWORD;
@@ -50,8 +57,8 @@ extern const char* CRYPTOKEY;
 // =========================================================================
 // PDP CONTEXT (GPRS/NB-IoT)
 // =========================================================================
-// #define PDP_CID 7
-#define PDP_CID 1
+#define PDP_CID 7
+// #define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
 #define PDP_APN "v-internet"
 #define USERNAME_APN ""
@@ -77,8 +84,8 @@ extern const int mqtt_port;
 // =========================================================================
 #define BAT_THRESH_PCT 90              // Battery percentage threshold that changes publication times
 #define BAT_HYST_PCT 3                 // Hysteresis to change publication time (this avoids jumping configuration)
-#define PUB_FAST_MS 60000UL            // Fast publication (when above battery threshold)
-#define PUB_SLOW_MS 150000UL            // Slow publication (when below battery threshold)
+#define PUB_FAST_MS 15000UL            // Fast publication (when above battery threshold)
+#define PUB_SLOW_MS 15000UL            // Slow publication (when below battery threshold)
 
 // =========================================================================
 // TIMING CONSTANTS

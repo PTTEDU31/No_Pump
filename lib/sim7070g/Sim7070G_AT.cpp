@@ -13,6 +13,8 @@ Sim7070G_AT::Sim7070G_AT(HardwareSerial* serial, size_t rxBufferSize)
     _queueTail(0),
     _queueCount(0),
     _currentCommand(nullptr),
+    _unsolicitedResponseCallback(nullptr),
+    _unsolicitedResponseUserData(nullptr),
     _urcHandlerCount(0),
     _responsePos(0)
 {
@@ -248,7 +250,10 @@ void Sim7070G_AT::processResponse() {
               }
               completeCommand(type, finalResponse);
             } else {
-              // No command waiting but got OK/ERROR - might be unsolicited, log it
+              // No command waiting but got OK/ERROR - unsolicited (e.g. MQTT publish response)
+              if (_unsolicitedResponseCallback) {
+                _unsolicitedResponseCallback(type, _responseBuffer, _unsolicitedResponseUserData);
+              }
               DEBUG_PRINT(F("[AT] Unsolicited response: "));
               DEBUG_PRINTLN(_responseBuffer);
             }
@@ -440,6 +445,11 @@ void Sim7070G_AT::setError(const char* error) {
   } else {
     _lastError[0] = '\0';
   }
+}
+
+void Sim7070G_AT::setUnsolicitedResponseCallback(ATCallback callback, void* userData) {
+  _unsolicitedResponseCallback = callback;
+  _unsolicitedResponseUserData = userData;
 }
 
 // Ring buffer helpers

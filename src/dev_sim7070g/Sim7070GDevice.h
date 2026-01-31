@@ -27,6 +27,7 @@ enum ModemState {
   MODEM_MQTT_CONNECTED_FIRST,         // MQTT connected first time
   MODEM_MQTT_CONNECTED,               // MQTT connected
   MODEM_WAITING_SUCCESS,              // Wait for done flag then transition to specified state
+  MODEM_WAITING_SEND_PACKET,          // Wait for Publish
   MODEM_ERROR
 };
 
@@ -74,6 +75,8 @@ public:
   // Telemetry / MQTT helpers
   Sim7070G* getModem() { return _modem; }
   bool isMqttConnected() const;
+  /** Check MQTT connection; if not connected, transition to MODEM_ERROR and return false */
+  bool checkMqttConnection();
   bool publishTelemetryNow(const char* payload);
   /** Enqueue telemetry to MQTT buffer; sent automatically when connected */
   bool enqueueTelemetry(const char* payload);
@@ -160,7 +163,7 @@ private:
   bool enqueueMessage(const char* topic, const char* payload, uint8_t qos);
   bool dequeueMessage(MQTTBufferedMessage& msg);
   void clearMessageBuffer();
-  bool flushMessageBuffer();
+  int flushMessageBuffer();
 };
 
 #endif // SIM7070G_DEVICE_H

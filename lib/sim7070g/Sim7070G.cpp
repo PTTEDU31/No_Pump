@@ -20,7 +20,10 @@ Sim7070G::Sim7070G(HardwareSerial *serial, uint8_t powerPin, uint32_t baudRate)
       _mqttMessageCallback(nullptr),
       _mqttStateCallback(nullptr),
       _atCommandCount(0),
-      _atErrorCount(0)
+      _atErrorCount(0),
+      _waitingPublishResponse(false),
+      _publishResponseReceived(false),
+      _publishResponseOk(false)
 {
   _instance = this;
 
@@ -70,6 +73,7 @@ bool Sim7070G::begin()
   _at.registerURCHandler("+CNACT", onURC_CNACT);
   _at.registerURCHandler("+APP PDP", onURC_APP_PDP);
   _at.registerURCHandler("+SMCONN", onURC_SMCONN);
+  _at.setUnsolicitedResponseCallback(onUnsolicitedResponse, this);
 
   updateState(Sim7070GState::INITIALIZING);
 
@@ -801,7 +805,7 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
   snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,%d,%d", topic, payloadLen, qos, retain ? 1 : 0);
   DEBUG_PRINTLN(F("[SMPUB] Command: "));
   DEBUG_PRINTLN(cmd);
-  if (!sendCommandSync(cmd, 500, response, 32));
+  if (!sendCommandSync(cmd, 200, response, 32));
   DEBUG_PRINT("Response HEX: ");
   for (size_t i = 0; i < strlen(response); i++) {
     DEBUG_PRINT(String(response[i], HEX));
@@ -820,7 +824,7 @@ bool Sim7070G::mqttPublish(const char *topic, const char *payload, uint8_t qos, 
 
   _serial->write(payload, payloadLen);
   _serial->flush();
-  // checkSendCommandSync("", "OK", 5000);
+  _waitingPublishResponse = true;
   return true;
 }
 
@@ -1350,6 +1354,30 @@ void Sim7070G::onURC_SMPUB(const char *urc, const char *data)
 {
   // Handle published message acknowledgment
   // Format: +SMPUB: <topic>,<result>
+}
+
+void Sim7070G::onUnsolicitedResponse(ATResponseType type, const char *response, void *userData)
+{
+  Sim7070G *self = (Sim7070G *)userData;
+  if (!self || !self->_waitingPublishResponse)
+    return;
+  self->_publishResponseReceived = true;
+  self->_publishResponseOk = (type == ATResponseType::OK);
+  self->_waitingPublishResponse = false;
+  DEBUG_PRINTLN(F("[URC] Publish response received"));
+  DEBUG_PRINTLN(F("[URC] Response: "));
+  DEBUG_PRINTLN(response);
+  DEBUG_PRINTLN();
+}
+
+bool Sim7070G::consumePublishResponse(bool *outOk)
+{
+  if (!_publishResponseReceived)
+    return false;
+  _publishResponseReceived = false;
+  if (outOk)
+    *outOk = _publishResponseOk;
+  return true;
 }
 
 void Sim7070G::onURC_SMSUB(const char *urc, const char *data)

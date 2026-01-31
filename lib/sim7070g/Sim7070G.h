@@ -117,6 +117,8 @@ public:
   bool mqttDisconnect();
   bool mqttPublish(const char* topic, const char* payload, uint8_t qos = 0, bool retain = false);
   bool mqttPublishHex(const char* topic, const uint8_t* payload, size_t len, uint8_t qos = 0, bool retain = false);
+  /** Consume publish response (OK/ERROR received after payload). Returns true if response was received; outOk = true for OK, false for ERROR. */
+  bool consumePublishResponse(bool* outOk = nullptr);
   bool mqttSubscribe(const char* topic, uint8_t qos = 0);
   bool mqttUnsubscribe(const char* topic);
   bool mqttGetState(MQTTState* state);
@@ -255,6 +257,11 @@ private:
   // Statistics
   uint32_t _atCommandCount;
   uint32_t _atErrorCount;
+
+  // Publish response (OK/ERROR after payload) - async
+  volatile bool _waitingPublishResponse;
+  volatile bool _publishResponseReceived;
+  volatile bool _publishResponseOk;
   
   // Internal methods
   void updateState(Sim7070GState newState);
@@ -270,6 +277,7 @@ private:
   static void onURC_CNACT(const char* urc, const char* data);
   static void onURC_APP_PDP(const char* urc, const char* data);
   static void onURC_SMCONN(const char* urc, const char* data);
+  static void onUnsolicitedResponse(ATResponseType type, const char* response, void* userData);
   
   // Static instance for URC callbacks
   static Sim7070G* _instance;

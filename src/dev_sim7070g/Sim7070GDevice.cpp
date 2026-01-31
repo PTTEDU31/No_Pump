@@ -177,8 +177,8 @@ int Sim7070GDevice::start()
   // char shortId[6];
   // strncpy(shortId, _nodeId, 5);
   // shortId[5] = '\0';
-  snprintf(_pubTopic, sizeof(_pubTopic), "xtr/server/%s", _nodeId);
-  snprintf(_subTopic, sizeof(_subTopic), "xtr/nodes/%s", _nodeId);
+  snprintf(_pubTopic, sizeof(_pubTopic), "xtr/nodes/%s", _nodeId);
+  snprintf(_subTopic, sizeof(_subTopic), "xtr/server/%s", _nodeId);
 
   // snprintf(_pubTopic, sizeof(_pubTopic), "%s", _nodeId);
   // snprintf(_subTopic, sizeof(_subTopic), "sub/%s", _nodeId);
@@ -311,7 +311,7 @@ bool Sim7070GDevice::ensureMqttReady()
     const char *pass = _mqttPassword[0] ? _mqttPassword : nullptr;
 
     if (!_modem->mqttSetConfig(_mqttClientId, _mqttBroker, _mqttPort,
-                               user, pass, MQTT_KEEPALIVE_SEC, _subTopic, _pubTopic, 0, false, false, false, true))
+                               user, pass, MQTT_KEEPALIVE_SEC, _subTopic, _pubTopic, 0, true, false, false, true))
     {
       return false;
     }
@@ -336,8 +336,6 @@ bool Sim7070GDevice::ensureMqttReady()
 
 void Sim7070GDevice::handleIncomingData()
 {
-  // Sim7070G library handles incoming data automatically in loop()
-  // This method is kept for compatibility but does nothing
   if (_modem)
   {
     _modem->loop();
@@ -356,31 +354,34 @@ void Sim7070GDevice::onMqttMessage(const char *topic, const uint8_t *payload, ui
     return;
   }
 
-  // Convert payload to null-terminated string (assuming it's HEX string)
+  // Convert payload to null-terminated string
   char hexPayload[600];
   size_t hexLen = (len > sizeof(hexPayload) - 1) ? sizeof(hexPayload) - 1 : len;
   memcpy(hexPayload, payload, hexLen);
   hexPayload[hexLen] = '\0';
 
-  DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+  DEBUG_PRINT(F("[RX] HEX payload len="));
   DEBUG_PRINTLN(strlen(hexPayload));
-  DEBUG_PRINTLN(hexPayload);
 
   const char *hexStr = hexPayload;
   size_t hexStrLen = strlen(hexStr);
 
-  // Encrypted path: valid HEX length and successful decode
   if ((hexStrLen % 2) == 0 && hexStrLen >= (12 + 16) * 2)
   {
+    DEBUG_PRINTLN(F("[DEBUG] HEX length check passed"));
     uint8_t buf[480];
     size_t bytes = 0;
-    if (hexDecode(hexStr, buf, sizeof(buf), bytes) && bytes >= (12 + 16))
+    bool decodeOk = hexDecode(hexStr, buf, sizeof(buf), bytes);
+    DEBUG_PRINT(F("[DEBUG] hexDecode result: "));
+    DEBUG_PRINT(decodeOk ? F("OK") : F("FAIL"));
+    DEBUG_PRINT(F(", bytes="));
+    DEBUG_PRINTLN(bytes);
+    
+    if (decodeOk && bytes >= (12 + 16))
     {
-      DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
-      DEBUG_PRINTLN(hexStrLen);
-      DEBUG_PRINTLN(hexPayload);
+      DEBUG_PRINT(F("[RX] Decoded binary, bytes="));
+      DEBUG_PRINTLN(bytes);
 
-      // Extract nonce, ciphertext, and tag
       uint8_t *nonce = buf;
       uint8_t *tag = buf + (bytes - 16);
       uint8_t *ct = buf + 12;
@@ -391,90 +392,102 @@ void Sim7070GDevice::onMqttMessage(const char *topic, const uint8_t *payload, ui
       int nM = nonce[5];
       int nS = nonce[6];
       int secMsg = nH * 3600 + nM * 60 + nS;
+      
+      DEBUG_PRINT(F("[TIME] Nonce time: "));
+      DEBUG_PRINT(nH);
+      DEBUG_PRINT(F(":"));
+      DEBUG_PRINT(nM);
+      DEBUG_PRINT(F(":"));
+      DEBUG_PRINT(nS);
+      DEBUG_PRINT(F(" (secMsg="));
+      DEBUG_PRINT(secMsg);
+      DEBUG_PRINTLN(F(")"));
 
-      // Get network time (try up to 5 times)
-      char isoNow[21] = {0};
-      int rH = 0, rM = 0, rS = 0;
-      bool timeOk = false;
+      // Get network time UTC (from CCLK converted to ISO) for comparison
+    char isoNow[21] = {0};
+    int rH = 0, rM = 0, rS = 0;
+    bool timeOk = false;
 
-      for (uint8_t attempt = 1; attempt <= 5; attempt++)
+    for (uint8_t attempt = 1; attempt <= 5; attempt++)
+    {
+      DEBUG_PRINT(F("[TIME] Try number "));
+      DEBUG_PRINT(attempt);
+      DEBUG_PRINTLN(F(" to obtain ISO time (UTC)..."));
+
+      memset(isoNow, 0, sizeof(isoNow));
+      if (_modem && _modem->getNetworkTimeISO8601(isoNow, sizeof(isoNow)))
       {
-        DEBUG_PRINT(F("[TIME] Try number "));
-        DEBUG_PRINT(attempt);
-        DEBUG_PRINTLN(F(" to obtain ISO time..."));
+        DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
+        DEBUG_PRINTLN(isoNow);
 
-        memset(isoNow, 0, sizeof(isoNow));
-        if (_modem && _modem->getNetworkTimeISO8601(isoNow, sizeof(isoNow)))
+        if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3)
         {
-          DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
-          DEBUG_PRINTLN(isoNow);
-
-          if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3)
-          {
-            DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
-            DEBUG_PRINTLN(attempt);
-            timeOk = true;
-            break;
-          }
-          else
-          {
-            DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
-          }
+          DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
+          DEBUG_PRINTLN(attempt);
+          timeOk = true;
+          break;
         }
         else
         {
-          DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
+          DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
         }
-
-        delay(200 * attempt);
       }
-
-      if (!timeOk)
+      else
       {
-        DEBUG_PRINTLN(F("[TIME] Unable to obtain hour from network after 5 tries. Command discarded."));
-        return;
+        DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
       }
 
-      // Calculate time difference (circular difference for 24-hour clock)
-      const int secNow = rH * 3600 + rM * 60 + rS;
-      const int DAY = 86400;
-      int d = abs(secMsg - secNow);
-      if (d > DAY)
-        d %= DAY;
-      int dsec = min(d, DAY - d);
+      delay(200 * attempt);
+    }
 
-      DEBUG_PRINT(F(" | NET HMS="));
-      DEBUG_PRINT(isoNow + 11);
-      DEBUG_PRINT(F(" | Δs="));
-      DEBUG_PRINTLN(dsec);
+    if (!timeOk)
+    {
+      DEBUG_PRINTLN(F("[TIME] Unable to obtain UTC from network after 5 tries. Command discarded."));
+      return;
+    }
 
-      // Check time window (30 seconds)
-      const int WINDOW_SEC = 30;
-      if (dsec > WINDOW_SEC)
-      {
-        DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
-        return;
-      }
+    // Calculate time difference (circular difference for 24-hour clock) - both sides use UTC
+    const int secNow = rH * 3600 + rM * 60 + rS;
+    const int DAY = 86400;
+    int d = abs(secMsg - secNow);
+    if (d > DAY)
+      d %= DAY;
+    int dsec = min(d, DAY - d);
 
-      // Decrypt payload
-      char plain[420];
-      bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
-      DEBUG_PRINT(F("[DECRYPT] Result: "));
-      DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
-      if (!ok)
-      {
-        return;
-      }
+    DEBUG_PRINT(F(" | NET UTC HMS="));
+    DEBUG_PRINT(isoNow + 11);
+    DEBUG_PRINT(F(" | Δs="));
+    DEBUG_PRINTLN(dsec);
 
-      DEBUG_PRINT(F("[RX] clear JSON: "));
-      DEBUG_PRINTLN(plain);
+    // Check time window (30 seconds)
+    const int WINDOW_SEC = 30;
+    if (dsec > WINDOW_SEC)
+    {
+      DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
+      // Send response to server when command is rejected
+      extern bool publishTelemetry();
+      DEBUG_PRINTLN(F("[TIME] Sending rejection response to server..."));
+      publishTelemetry();
+      return;
+    }
+
+    // Decrypt payload
+    char plain[420];
+    bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
+    DEBUG_PRINT(F("[DECRYPT] Result: "));
+    DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
+    if (!ok)
+    {
+      return;
+    }
+
+    DEBUG_PRINT(F("[RX] clear JSON: "));
+    DEBUG_PRINTLN(plain);
 
       handleMqttCommandJson(plain);
       return;
     }
-  } // end if valid hex length
-
-  // Plain text path: payload is not encrypted HEX (e.g. "hello" or {"X":1})
+  }
   DEBUG_PRINTLN(F("[RX] Plain text message"));
   char plainBuf[512];
   size_t plainLen = (len < sizeof(plainBuf) - 1) ? len : sizeof(plainBuf) - 1;
@@ -488,6 +501,8 @@ void Sim7070GDevice::handleMqttCommandJson(const char *plain)
 {
   if (!plain)
     return;
+
+  bool shouldPublishResponse = false;
 
   long xVal = -1;
   if (jsonGetInt(plain, "X", xVal))
@@ -506,11 +521,13 @@ void Sim7070GDevice::handleMqttCommandJson(const char *plain)
         DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protection ("));
         DEBUG_PRINT(remain / 1000UL);
         DEBUG_PRINTLN(F(" s remaining)."));
+        shouldPublishResponse = true;  // Send response when command is ignored
       }
       else
       {
         DEBUG_PRINTLN(F("[ACT] Turning pump ON"));
         g_pumpDevice->requestTurnOn();
+        shouldPublishResponse = true;  // Send response after turning ON
       }
     }
     else if (xVal == 0)
@@ -519,6 +536,7 @@ void Sim7070GDevice::handleMqttCommandJson(const char *plain)
       g_pumpDevice->setLastOffByHexFlag(true);
       g_pumpDevice->requestTurnOff();
       g_pumpDevice->armProtection("Turned off by HEX command");
+      shouldPublishResponse = true;  // Send response after turning OFF
     }
     else
     {
@@ -537,6 +555,21 @@ void Sim7070GDevice::handleMqttCommandJson(const char *plain)
     int onPulse = constrain((int)newPulse, 500, 10000);
     DEBUG_PRINT(F("[ACT] onPulse updated to "));
     DEBUG_PRINTLN(onPulse);
+  }
+
+  // Send response back to server after processing command
+  if (shouldPublishResponse)
+  {
+    extern bool publishTelemetry();
+    DEBUG_PRINTLN(F("[ACT] Sending response to server..."));
+    if (publishTelemetry())
+    {
+      DEBUG_PRINTLN(F("[ACT] Response sent successfully"));
+    }
+    else
+    {
+      DEBUG_PRINTLN(F("[ACT] Response enqueued (will send when connected)"));
+    }
   }
 }
 
@@ -568,7 +601,7 @@ int Sim7070GDevice::timeout()
     digitalWrite(MODEM_POWER_PIN, LOW);
     delay(1500);
     digitalWrite(MODEM_POWER_PIN, HIGH);
-    delay(2000);
+    delay(1500);
     digitalWrite(MODEM_POWER_PIN, LOW);
     delay(200);
     updateState(MODEM_POWER_ON);
@@ -926,7 +959,7 @@ int Sim7070GDevice::timeout()
       }
       return 20000;
     }
-    _retryCount = 0;  // Reset on success
+    _retryCount = 0; // Reset on success
   }
   case MODEM_MQTT_CONNECTING:
   {
@@ -951,10 +984,11 @@ int Sim7070GDevice::timeout()
     }
     else
     {
-      
-      if(!_modem->checkSendCommandSync("AT+SMDISC", "OK", 15000)){
+
+      if (!_modem->checkSendCommandSync("AT+SMDISC", "OK", 15000))
+      {
         DEBUG_PRINTLN(F("[SIM7070G] MQTT disconnect failed, retrying..."));
-        powerPulse();    
+        powerPulse();
       }
       DEBUG_PRINTLN(F("[SIM7070G] MQTT connect failed, disconnecting and retrying..."));
       return 30000;
@@ -978,7 +1012,8 @@ int Sim7070GDevice::timeout()
       // Publish online status
       char msg[160];
       snprintf(msg, sizeof(msg), "{\"id\":\"%s\",\"status\":\"online\"}", _nodeId);
-      enqueueTelemetry(msg);
+      // enqueueTelemetry(msg);
+      DEBUG_PRINTLN(msg);
 
       _lastHeartbeatMs = millis();
       updateState(MODEM_MQTT_CONNECTED);
@@ -1085,10 +1120,31 @@ int Sim7070GDevice::timeout()
     if (_bufferCount > 0)
     {
       flushMessageBuffer();
+      updateState(MODEM_WAITING_SEND_PACKET);      
     }
 
-    return 20000;
+    return 3000;
 
+  case MODEM_WAITING_SEND_PACKET:
+    handleIncomingData();
+    static unsigned long waitingSendStartMs = 0;
+    if (waitingSendStartMs == 0) {
+      waitingSendStartMs = millis();
+    }
+    {
+      bool publishOk = false;
+      if (_modem->consumePublishResponse(&publishOk)) {
+        DEBUG_PRINTLN(F("[SIM7070G] Publish response received"));
+        // OK or ERROR received after sending payload
+        updateState(MODEM_MQTT_CONNECTED);
+        waitingSendStartMs = 0;
+      } else if ((millis() - waitingSendStartMs) >= 10000UL) {
+        DEBUG_PRINTLN(F("[SIM7070G] Publish timeout, transitioning to MQTT connected"));
+        updateState(MODEM_MQTT_CONNECTED);
+        waitingSendStartMs = 0;
+      }
+    }
+    return 10;
   case MODEM_ERROR:
     DEBUG_PRINTLN(F("[SIM7070G] Error state, retrying full init..."));
     _stats.modemRestarts++;
@@ -1117,6 +1173,8 @@ static const __FlashStringHelper *modemStateName(ModemState s)
     return F("MODEM_INITIALIZING");
   case MODEM_POWER_ON:
     return F("MODEM_POWER_ON");
+  case MODEM_RESET:
+    return F("MODEM_RESET");
   case MODEM_ACTIVATE_CNACT_FIRST:
     return F("MODEM_ACTIVATE_CNACT_FIRST");
   case MODEM_WAIT_FOR_IP_FIRST:
@@ -1147,6 +1205,8 @@ static const __FlashStringHelper *modemStateName(ModemState s)
     return F("MODEM_MQTT_CONNECTED");
   case MODEM_WAITING_SUCCESS:
     return F("MODEM_WAITING_SUCCESS");
+  case MODEM_WAITING_SEND_PACKET:
+    return F("MODEM_WAITING_SEND_PACKET");
   case MODEM_ERROR:
     return F("MODEM_ERROR");
   default:
@@ -1256,12 +1316,12 @@ void Sim7070GDevice::clearMessageBuffer()
   DEBUG_PRINTLN(F("[SIM7070G] Message buffer cleared"));
 }
 
-// Flush all buffered messages
-bool Sim7070GDevice::flushMessageBuffer()
+// Flush one buffered message; returns so luong messages con lai trong buffer
+int Sim7070GDevice::flushMessageBuffer()
 {
   if (_bufferCount == 0)
   {
-    return true;
+    return 0;
   }
 
   DEBUG_PRINT(F("[SIM7070G] Flushing "));
@@ -1270,49 +1330,41 @@ bool Sim7070GDevice::flushMessageBuffer()
 
   uint8_t successCount = 0;
   uint8_t failCount = 0;
-  uint8_t messagesToSend = _bufferCount;
 
-  for (uint8_t i = 0; i < messagesToSend; i++)
+  MQTTBufferedMessage msg;
+  if (!dequeueMessage(msg))
   {
-    MQTTBufferedMessage msg;
-    if (!dequeueMessage(msg))
-    {
-      break;
-    }
+    DEBUG_PRINT("Buffer is null");
+    return (int)_bufferCount;
+  }
 
-    DEBUG_PRINT(F("[SIM7070G] Sending buffered message: "));
-    DEBUG_PRINTLN(msg.topic);
+  DEBUG_PRINT(F("[SIM7070G] Sending buffered message: "));
+  DEBUG_PRINTLN(msg.topic);
 
-    if (_state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected())
+  if (_state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected())
+  {
+    DEBUG_PRINTLN(F("[SIM7070G] Publishing message: "));
+    updateState(MODEM_MQTT_CONNECTED);
+    msg.length = strlen(msg.payload);
+    if (_modem->mqttPublish(msg.topic, msg.payload, msg.qos, false))
     {
-      DEBUG_PRINTLN(F("[SIM7070G] Publishing message: "));
-      // updateState(MODEM_WAITING_SUCCESS);
-      updateState(MODEM_MQTT_CONNECTED);
-      // msg.payload is char[], so it's compatible with mqttPublish
-      msg.length = strlen(msg.payload);
-      if (_modem->mqttPublish(msg.topic, msg.payload, msg.qos, false))
-      // if (_modem->mqttPublishHex(msg.topic, (const uint8_t*)msg.payload, msg.length, msg.qos, false))
-      {
-        successCount++;
-      }
-      else
-      {
-        failCount++;
-        enqueueMessage(msg.topic, msg.payload, msg.qos);
-        break;
-      }
+      successCount++;
     }
     else
     {
-      DEBUG_PRINTLN(F("[SIM7070G] Not connected to MQTT, dropping message"));
-      updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
       failCount++;
       enqueueMessage(msg.topic, msg.payload, msg.qos);
-      break;
+      DEBUG_PRINT("can't sent mqtt");
+      return -1;
     }
-
-    // Small delay between messages
-    delay(100);
+  }
+  else
+  {
+    DEBUG_PRINTLN(F("[SIM7070G] Not connected to MQTT, dropping message"));
+    updateState(MODEM_MQTT_CONNECTING_HANDSHAKE);
+    failCount++;
+    enqueueMessage(msg.topic, msg.payload, msg.qos);
+    return -1;
   }
 
   DEBUG_PRINT(F("[SIM7070G] Buffer flush complete: "));
@@ -1323,19 +1375,29 @@ bool Sim7070GDevice::flushMessageBuffer()
   DEBUG_PRINT(_bufferCount);
   DEBUG_PRINTLN(F(" remaining"));
 
-  return (failCount == 0);
+  return (int)_bufferCount;
 }
 
 bool Sim7070GDevice::isMqttConnected() const
 {
-  return _state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected();
+  return (_state == MODEM_MQTT_CONNECTED && _modem && _modem->isMQTTConnected());
 }
 
-bool Sim7070GDevice::publishTelemetryNow(const char *payload)
+bool Sim7070GDevice::checkMqttConnection()
 {
-  if (!isMqttConnected() || !_modem || !payload)
-    return false;
-  return _modem->mqttPublish(_pubTopic, payload, 1, false);
+  if (_state == MODEM_MQTT_CONNECTED)
+  {
+    if (_modem && _modem->isMQTTConnected())
+    {
+      return true;
+    }
+    else
+    {
+      updateState(MODEM_ERROR);
+      return false;
+    }
+  }
+  return false;
 }
 
 bool Sim7070GDevice::enqueueTelemetry(const char *payload)

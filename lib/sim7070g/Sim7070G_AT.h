@@ -67,6 +67,9 @@ public:
   // Get last error
   const char* getLastError() const { return _lastError; }
 
+  // Callback when OK/ERROR received with no command waiting (e.g. MQTT publish response)
+  void setUnsolicitedResponseCallback(ATCallback callback, void* userData);
+
 private:
   HardwareSerial* _serial;
   uint8_t* _rxBuffer;
@@ -82,6 +85,10 @@ private:
   uint8_t _queueTail;
   uint8_t _queueCount;
   ATCommand* _currentCommand;
+
+  // Unsolicited OK/ERROR callback (e.g. after MQTT publish payload)
+  ATCallback _unsolicitedResponseCallback;
+  void* _unsolicitedResponseUserData;
 
   // URC handlers
   static const uint8_t MAX_URC_HANDLERS = 16;
