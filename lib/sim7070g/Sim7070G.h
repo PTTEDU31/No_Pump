@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "Sim7070G_AT.h"
+#include "config.h"
 
 // Network states
 enum class Sim7070GState {
@@ -66,7 +67,7 @@ struct MQTTMessage {
 
 class Sim7070G {
 public:
-  Sim7070G(HardwareSerial* serial, uint8_t powerPin = 12, uint32_t baudRate = 19200);
+  Sim7070G(HardwareSerial* serial, uint8_t powerPin = 12, uint32_t baudRate = MODEM_BAUD_RATE);
   ~Sim7070G();
 
   // Initialization

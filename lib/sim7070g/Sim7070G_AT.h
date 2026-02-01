@@ -2,6 +2,7 @@
 #define SIM7070G_AT_H
 
 #include <Arduino.h>
+#include "config.h"
 
 // AT Response types
 enum class ATResponseType {
@@ -37,7 +38,7 @@ public:
   ~Sim7070G_AT();
 
   // Initialize
-  bool begin(uint32_t baudRate = 19200);
+  bool begin(uint32_t baudRate = MODEM_BAUD_RATE);
 
   // Main loop - call this frequently (non-blocking)
   void loop();
