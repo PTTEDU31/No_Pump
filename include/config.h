@@ -12,10 +12,36 @@ extern const char* PASSWORD;
 extern const char* CRYPTOKEY;
 
 // =========================================================================
+// DEBUG / DIAGNOSTIC
+// =========================================================================
+#define DEBUG true  // Set to false to silence serial prints
+#define DIAG false
+
+#if DEBUG
+#define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#define DEBUG_PRINT_F(x, p) Serial.print((x), (p))
+#define DEBUG_PRINTLN_F(x, p) Serial.println((x), (p))
+#else
+#define DEBUG_PRINT(...)
+#define DEBUG_PRINTLN(...)
+#define DEBUG_PRINT_F(...)
+#define DEBUG_PRINTLN_F(...)
+#endif
+
+#if DIAG
+#define DIAG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DIAG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#else
+#define DIAG_PRINT(...)
+#define DIAG_PRINTLN(...)
+#endif
+
+// =========================================================================
 // PIN DEFINITIONS
 // =========================================================================
 #define sim7070 Serial1
-#define MODEM_PWR_PIN 12  // Pin to turn on/off the modem (also defined in Sim7070GDevice.h as MODEM_POWER_PIN)
+#define MODEM_PWR_PIN 12  // Pin to turn on/off the modem
 #define CONTACT_PIN 20    // Pin to detect whether the pump is on or off
 #define PWR_ON_PIN 4      // Pin to turn on pump (on relay)
 #define PWR_OFF_PIN 3     // Pin to turn pump off (off relay)
@@ -38,9 +64,8 @@ extern const char* CRYPTOKEY;
 // =========================================================================
 // PDP CONTEXT (GPRS/NB-IoT)
 // =========================================================================
-#define PDP_CID 7
-// #define PDP_APN "iot.1nce.net"
-#define PDP_APN "m3-world"
+#define PDP_CID 1
+#define PDP_APN "iot.1nce.net"
 
 // Network Mode Selection: 0 = GPRS (Cat-M1/2G), 1 = NB-IoT
 // Change this to switch between GPRS and NB-IoT modes
@@ -56,6 +81,11 @@ extern const char* CRYPTOKEY;
 // =========================================================================
 extern const char mqtt_server[];
 extern const int mqtt_port;
+extern char topic_sub[96];
+extern char topic_pub[96];
+extern char clientID[64];
+extern char mqtt_username[64];
+extern char mqtt_password[64];
 
 // =========================================================================
 // BATTERY & PUBLISH INTERVALS
@@ -113,4 +143,5 @@ extern const int mqtt_port;
 #define SIM_WAIT_MS 1000
 #define ON_PULSE_MS 5000
 
+#define TEMP_CHECK_INTERVAL_MS 10000UL
 #endif // CONFIG_H

@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "config.h"
 #include "device.h"
 
 // For SAMD21 (Arduino Nano 33 IoT) - single core architecture
