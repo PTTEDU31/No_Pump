@@ -242,6 +242,16 @@ private:
   char _customTerminator[16];
   bool _useCustomTerminator;
   
+  // Sync command state tracking
+  struct SyncCommandState {
+    bool active;
+    bool completed;
+    ATResponseType result;
+    char response[AT_MAX_RESPONSE_LENGTH];
+    const char* expectedResponse;
+  };
+  SyncCommandState _syncState;
+  
   // Internal methods
   void processSerial();
   void processLine(const char* line);
@@ -251,6 +261,9 @@ private:
   bool dequeueCommand();
   void completeCommand(ATResponseType type);
   void debugPrint(const char* prefix, const char* msg);
+  
+  // Sync helper: Callback for sync commands
+  static void syncCommandCallback(ATResponseType type, const char* response, void* userData);
 };
 
 #endif // AT_COMMAND_LIB_H

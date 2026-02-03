@@ -22,6 +22,9 @@ ATCommandManager::ATCommandManager(Stream* serial)
   memset(_urcHandlers, 0, sizeof(_urcHandlers));
   memset(_rxBuffer, 0, sizeof(_rxBuffer));
   memset(_customTerminator, 0, sizeof(_customTerminator));
+  memset(&_syncState, 0, sizeof(_syncState));
+  _syncState.active = false;
+  _syncState.completed = false;
 }
 
 // Destructor
@@ -225,7 +228,24 @@ bool ATCommandManager::sendCommandAsync(const char* cmd, unsigned long timeout,
   return enqueueCommand(newCmd);
 }
 
-// Send command synchronously (blocking)
+// Static callback for sync commands
+void ATCommandManager::syncCommandCallback(ATResponseType type, const char* response, void* userData) {
+  if (!userData) return;
+  
+  ATCommandManager* manager = (ATCommandManager*)userData;
+  
+  // Store result
+  manager->_syncState.result = type;
+  manager->_syncState.completed = true;
+  
+  // Copy response if available
+  if (response && response[0] != '\0') {
+    strncpy(manager->_syncState.response, response, sizeof(manager->_syncState.response) - 1);
+    manager->_syncState.response[sizeof(manager->_syncState.response) - 1] = '\0';
+  }
+}
+
+// IMPROVED: Send command synchronously using async path + loop()
 bool ATCommandManager::sendCommandSync(const char* cmd, const char* expectedResponse,
                                        unsigned long timeout,
                                        char* response, size_t responseSize) {
@@ -235,77 +255,65 @@ bool ATCommandManager::sendCommandSync(const char* cmd, const char* expectedResp
     debugPrint("TX_SYNC", cmd);
   }
   
-  // Clear any pending data
-  while (_serial->available()) {
-    _serial->read();
-  }
+  // Initialize sync state
+  _syncState.active = true;
+  _syncState.completed = false;
+  _syncState.result = ATResponseType::NONE;
+  _syncState.response[0] = '\0';
+  _syncState.expectedResponse = expectedResponse;
   
-  // Send command
-  _serial->println(cmd);
-  _stats.bytesSent += strlen(cmd) + 2; // +2 for \r\n
-  _stats.commandsSent++;
-  
-  // Wait for response
-  unsigned long start = millis();
-  char buffer[256];
-  size_t pos = 0;
-  bool found = false;
-  bool error = false;
-  
-  if (response && responseSize > 0) {
-    response[0] = '\0';
-  }
-  
-  while ((millis() - start) < timeout) {
-    while (_serial->available()) {
-      char c = _serial->read();
-      _stats.bytesReceived++;
-      
-      if (c == '\r' || c == '\n') {
-        if (pos > 0) {
-          buffer[pos] = '\0';
-          
-          // Store response if buffer provided
-          if (response && responseSize > 0) {
-            size_t respLen = strlen(response);
-            if (respLen < responseSize - 1) {
-              strncat(response, buffer, responseSize - respLen - 1);
-              strncat(response, "\n", responseSize - respLen - 1);
-            }
-          }
-          
-          // Check for expected response
-          if (expectedResponse && strstr(buffer, expectedResponse) != nullptr) {
-            found = true;
-          }
-          
-          // Check for error
-          if (strstr(buffer, "ERROR") != nullptr) {
-            error = true;
-            break;
-          }
-          
-          pos = 0;
-        }
-      } else if (pos < sizeof(buffer) - 1) {
-        buffer[pos++] = c;
-      }
+  // Send command using async path (reuses all logic!)
+  if (!sendCommandAsync(cmd, timeout, syncCommandCallback, this)) {
+    _syncState.active = false;
+    if (_debug) {
+      debugPrint("SYNC_FAIL", "Queue full");
     }
-    
-    if (found || error) break;
-    
-    delay(10); // Small delay to avoid tight loop
+    return false;
   }
   
-  if (found) {
-    _stats.commandsOK++;
-  } else if (error) {
-    _stats.commandsError++;
-  } else {
-    _stats.commandsTimeout++;
+  // Wait for completion by calling loop() repeatedly
+  // This ensures URCs are still processed!
+  unsigned long start = millis();
+  
+  while (!_syncState.completed && (millis() - start) < timeout) {
+    loop();  // ✅ Reuse async processing path
+    
+    delay(1);  // Small delay to avoid tight loop
   }
   
-  return found;
+  // Check if timed out
+  if (!_syncState.completed) {
+    if (_debug) {
+      debugPrint("SYNC_TIMEOUT", cmd);
+    }
+    _syncState.active = false;
+    return false;
+  }
+  
+  // Copy response to user buffer if provided
+  if (response && responseSize > 0 && _syncState.response[0] != '\0') {
+    strncpy(response, _syncState.response, responseSize - 1);
+    response[responseSize - 1] = '\0';
+  }
+  
+  // Check if expected response was found
+  bool success = false;
+  if (_syncState.result == ATResponseType::OK) {
+    // If expectedResponse specified, verify it's in the response
+    if (expectedResponse) {
+      success = (strstr(_syncState.response, expectedResponse) != nullptr);
+    } else {
+      success = true;  // No specific response expected, OK is enough
+    }
+  }
+  
+  _syncState.active = false;
+  
+  if (_debug) {
+    debugPrint("SYNC_RESULT", success ? "OK" : "FAIL");
+  }
+  
+  return success;
 }
 
 // Register URC handler
