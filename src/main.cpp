@@ -6,7 +6,6 @@
 #include <ChaChaPoly.h>
 #include <math.h>
 #include "wiring_private.h"
-#include "config.h"
 ///////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////
 // Change the secrets from the portal to the following fields in the corresponding variables
@@ -46,17 +45,27 @@ TemperatureZero tempSAMD;
 #endif
 
 // ----------------- PINS -----------------
-// Defined in config.h:
-// - sim7070, MODEM_PWR_PIN, CONTACT_PIN, PWR_ON_PIN, PWR_OFF_PIN
-// - ADC_PIN_1, ADC_PIN_2, ADC_PIN_3, BATT_VOLTS, Input_Supply_V
-// - RS485_RX_PIN, RS485_TX_PIN
+#define sim7070 Serial1
+#define MODEM_PWR_PIN 12  // Pin to turn on/off the modem
+#define CONTACT_PIN 20    // Pin to detect whether the pump is on or off
+#define PWR_ON_PIN 4      // Pin to turn un pump (on relay)
+#define PWR_OFF_PIN 3     // Pin to turn pump off (off relay)
+
+#define ADC_PIN_1 A0       // AC Transducer input (line 1)
+#define ADC_PIN_2 A1       // AC Transducer input (line 2)
+#define ADC_PIN_3 A2       // AC Transducer input (line 3)
+#define BATT_VOLTS A3      // Battery voltage input pin
+#define Input_Supply_V 21  // Main power detection pin (detects whether there is power from the main line)
+
+#define RS485_RX_PIN 5  // PIN RX for RS485 module
+#define RS485_TX_PIN 6  // PIN TX for RS485 module
 
 // ----------------- PDP CONTEXT -----------------
-// Defined in config.h:
-// - PDP_CID, PDP_APN
+#define PDP_CID 1
+#define PDP_APN "m3-world"
 
 // ----------------- WATCHDOG -----------------
-// Defined in config.h: HW_WDT_TIMEOUT_SEC
+#define HW_WDT_TIMEOUT_SEC 16
 static inline void WDT_INIT() {
   Watchdog.enable(HW_WDT_TIMEOUT_SEC * 1000);
 }
@@ -84,8 +93,10 @@ bool mqttConnected = false;
 unsigned long lastPublish = 0;
 
 // ---- PUBLISH / BATTERY (CONFIGURABLE) ----
-// Defined in config.h:
-// - BAT_THRESH_PCT, BAT_HYST_PCT, PUB_FAST_MS, PUB_SLOW_MS
+constexpr int BAT_THRESH_PCT = 90;              // Battery percentage threshold that changes publication times
+constexpr int BAT_HYST_PCT = 3;                 // Hysteresis to change publication time (this avoids jumping configuration)
+constexpr unsigned long PUB_FAST_MS = 15000UL;  // Fast publication (when above battery threshold)
+constexpr unsigned long PUB_SLOW_MS = 30000UL;  // Slow publication (when below battery threshold)
 
 // PREVIOUS STATE OF THE MAIN POWER LINE ----------
 bool prevPwrOn = false;  // it is initialized in setup()
@@ -94,20 +105,20 @@ unsigned long publishIntervalMs = PUB_FAST_MS;
 
 // -------------CHECK CONNECTIONS INTERVAL----
 unsigned long lastCheck = 0;
-const unsigned long checkInterval = CHECK_INTERVAL_MS;  // From config.h
+const unsigned long checkInterval = 15000;
 
 byte pump = 0;
-int onPulse = ON_PULSE_MS;  // From config.h
+int onPulse = 5000;
 bool serverOnCommand = false;
 String receivedMessage = "";
 
 // TIMINGS
-int readResponseWait = READ_RESPONSE_WAIT_MS;  // From config.h
-int simWait = SIM_WAIT_MS;  // From config.h
+int readResponseWait = 300;
+int simWait = 1000;
 
 // ===== UART Quiet Period =====
 static unsigned long lastUartActivity = 0;
-const unsigned long healthQuietMs = HEALTH_QUIET_MS;  // From config.h
+const unsigned long healthQuietMs = 2000;
 inline void noteUartActivity() {
   lastUartActivity = millis();
 }
@@ -115,22 +126,25 @@ inline bool canRunHealthCheck() {
   return (millis() - lastUartActivity) > healthQuietMs;
 }
 // === ADJUSTABLE TIMING CONSTANTS FOR FUNCTION modemRestart() ----------
-// Defined in config.h:
-// - PWRKEY_MS, PRE_DRAIN_MS, OFF_WAIT_MS, BOOT_WAIT_MS
+const unsigned long PWRKEY_MS = 1600;     // valid pulse (1.5–2.0 s)
+const unsigned long PRE_DRAIN_MS = 40;    // clean UART backlogs before hitting PWRKEY
+const unsigned long OFF_WAIT_MS = 9000;   // give time if the first toggle was ON->OFF
+const unsigned long BOOT_WAIT_MS = 6000;  // boot time after the final on pulse
 
 // ---- COUNTERS FOR RESTARTS/RECONNECTIONS ----
 volatile uint32_t cntModemRestarts = 0;          // restarts via PWRKEY
 volatile uint32_t cntGprsConnects = 0;           // successful PDP activations
 volatile uint32_t cntMqttConnects = 0;           // successful MQTT connections
-const unsigned long ReconnIntervalMs = RECONN_INTERVAL_MS;  // From config.h
+const unsigned long ReconnIntervalMs = 10000UL;  // 10 s
 
 // --------- RESTART DEBOUNCE ------------
+
 unsigned long lastRestartMs = 0;
-const unsigned long minRestartGapMs = MIN_RESTART_GAP_MS;  // From config.h
+const unsigned long minRestartGapMs = 15000;
 
 // -------- MONITOR CPU TEMPERATURE -----------
 unsigned long lastTempCheck = 0;
-const unsigned long tempInterval = TEMP_CHECK_INTERVAL_MS;  // From config.h
+const unsigned long tempInterval = 10000;
 
 // -------- VIBRATION ---------
 int vibrationCount = 0;
@@ -146,12 +160,15 @@ static unsigned long lastGPRSokMs = 0;
 static unsigned long lastMQTTokMs = 0;
 
 // --------- VARIABLES FOR FUNCTION checkConnections()
-// Defined in config.h:
-// - AT_FAILS_BEFORE_RESTART, GPRS_FAILS_BEFORE_RESTART, MQTT_FAILS_BEFORE_RESTART
-const unsigned long recentOkGraceMs = RECENT_OK_GRACE_MS;  // From config.h
+const uint8_t AT_FAILS_BEFORE_RESTART = 2;    // more tolerant; initially 6
+const uint8_t GPRS_FAILS_BEFORE_RESTART = 3;  // initially 3
+const uint8_t MQTT_FAILS_BEFORE_RESTART = 3;  // initially 3
+
+const unsigned long recentOkGraceMs = 16000UL;  // initially 180000 (3 min) of "grace" if it recently was OK
 
 // ---- PUMP ON-PROTECTION  ----
-// Defined in config.h: PROTECT_ON_MS, PROTECT_TICK_MS
+const unsigned long PROTECT_ON_MS = 120000UL;   // 2 minutes
+const unsigned long PROTECT_TICK_MS = 10000UL;  // 10 second announcement
 
 volatile bool protectOnStart = false;
 unsigned long protectStartMs = 0;
@@ -164,7 +181,11 @@ volatile bool lastOffByHexFlag = false;
 bool prevPumpOn = false;  // It is initialized in setup() after reading the pin
 
 // VALUES FOR READING THE VOLTAGES OF THE BATTERIES
-// Defined in config.h: ADC_VREF, ADC_MAX, R_TOP, R_BOTTOM
+constexpr float ADC_VREF = 3.3f;  // calibrate if the real 3V3 differs
+constexpr float ADC_MAX = 4095.0f;
+
+constexpr float R_TOP = 100000.0f;     // 100k (BAT+ -> node)
+constexpr float R_BOTTOM = 220000.0f;  // 220k (node -> GND)
 
 // ------------- RS 485 ------------------
 
@@ -175,8 +196,11 @@ byte messege[256];
 uint8_t index_request = 2;
 float parameters[64];
 
-// Modbus addresses defined in config.h:
-// - METER_CURRENT_ADDRESS, METER_CUMULATIVE_ADDRESS
+// Constant water flow address
+#define METER_CURRENT_ADDRESS 0x00000002
+
+// Cumulative water flow address
+#define METER_CUMULATIVE_ADDRESS 0x00380002
 
 
 struct modbus_transmit {
@@ -296,7 +320,7 @@ void setup() {
   delay(100);
 
 
-  sim7070.begin(MODEM_BAUD_RATE);
+  sim7070.begin(115200);
 
   tempSAMD.init();
   analogReadResolution(12);
