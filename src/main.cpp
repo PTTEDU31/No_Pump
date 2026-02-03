@@ -76,6 +76,30 @@ unsigned long publishIntervalMs = PUB_FAST_MS;
 // CHECK CONNECTIONS INTERVAL from config.h (CHECK_INTERVAL_MS)
 unsigned long lastCheck = 0;
 
+// ----------------- CONNECTION STATE MACHINE (async) -----------------
+enum ConnState {
+  CONN_IDLE,
+  CONN_CHECK_AT,
+  CONN_AT_FAIL,
+  CONN_RESTART_MODEM,
+  CONN_RESTART_WAIT,
+  CONN_CHECK_CNACT,
+  CONN_GPRS_ACTIVATE,
+  CONN_GPRS_WAIT_URC,
+  CONN_GPRS_FALLBACK,
+  CONN_MQTT_CONFIG,
+  CONN_MQTT_DISCONNECT,   // SMDISC before retry SMCONN
+  CONN_MQTT_CONNECT,
+  CONN_MQTT_VERIFY,
+  CONN_DONE
+};
+
+static ConnState connState = CONN_IDLE;
+static uint8_t connSubStep = 0;       // retry/attempt counter within a state
+static unsigned long connStateStartMs = 0;
+static char connResponseBuf[320];     // for async AT response
+static bool connWaitingAT = false;    // avoid spamming AT in RESTART_WAIT
+
 byte pump = 0;
 int onPulse = ON_PULSE_MS;
 bool serverOnCommand = false;
@@ -179,6 +203,14 @@ bool gprsIsConnected();
 void handleMQTTMessages();
 void flushSIMBuffer();
 void checkConnections();
+static void connOnATResult(ATResponseType type, const char* response, void* userData);
+static void connOnCNACTDisconnectResult(ATResponseType type, const char* response, void* userData);
+static void connOnCNACTQueryResult(ATResponseType type, const char* response, void* userData);
+static void connOnCNACTActivateResult(ATResponseType type, const char* response, void* userData);
+static void connOnSMDISCResult(ATResponseType type, const char* response, void* userData);
+static void connOnSMCONNResult(ATResponseType type, const char* response, void* userData);
+static void connTransition(ConnState next, uint8_t subStep = 0);
+static void connSendNext();  // sends next async command based on connState
 void turnOnPump();
 void turnOffPump();
 void verifySIMConnected();
@@ -546,206 +578,236 @@ void diagSnapshot(const char* label) {
   DIAG_PRINTLN("");
 }
 
-// ----------------- HEALTH/RECONNECTIONS -----------------
-void checkConnections() {
-  if ((long)(millis() - lastCheck) < (long)CHECK_INTERVAL_MS) return;
+// ----------------- CONNECTION STATE MACHINE (async) -----------------
+static void connTransition(ConnState next, uint8_t subStep) {
+  connState = next;
+  connSubStep = subStep;
+  connStateStartMs = millis();
+}
 
-  if (!canRunHealthCheck()) {
-    if (DIAG) DIAG_PRINTLN(F("[DIAG] checkConnections posponed: recent UART activity"));
-    return;
-  }
-  /*
-  unsigned long t0 = millis();
-  while (millis() - t0 < 40) {
-    while (sim7070.available()) { (void)sim7070.read(); }
-    DEBUG_PRINTLN("The SIM7070G has been emptied");
-    delay(1);
-  }
-*/
-  if (!canRunHealthCheck()) {
-    if (DIAG) DIAG_PRINTLN(F("[DIAG] posponed after soft-drain"));
-    return;
-  }
-
-  lastCheck = millis();
-
-  bool atOk = false;
-  for (byte attempt = 0; attempt < 3; attempt++) {
-    if (modemAlivePing()) {
-      atOk = true;
-      break;
-    }
-    DEBUG_PRINT(F("Without 'AT' response. Short retry... (try number: "));
-    DEBUG_PRINT(attempt + 1);
-    DEBUG_PRINTLN(F(")..."));
-    delay(180);
-    WDT_RESET();
-  }
-
-  if (!atOk) {
-    atFailStreak++;
-    DEBUG_PRINT(F("AT fail streak = "));
-    DEBUG_PRINTLN(atFailStreak);
-
-    if ((millis() - lastATokMs) < RECENT_OK_GRACE_MS && atFailStreak < AT_FAILS_BEFORE_RESTART) {
-      DEBUG_PRINTLN(F("Recent Ok and few failures: DO NOT restart (grace period)."));
-      return;
-    }
-    if (atFailStreak < AT_FAILS_BEFORE_RESTART) {
-      DEBUG_PRINTLN(F("AT failed under threshold. Will try later."));
-      return;
-    }
-    if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
-      DEBUG_PRINTLN(F("Restart blocked by debounce. Waiting for next cycle."));
-      return;
-    }
-
-    DEBUG_PRINTLN(F("Modem not responding consistently. Restarting..."));
-    modemRestart();
-    atFailStreak = 0;
-    if (!gprsConnect()) return;
-    mqttConnect();
-    return;
-  } else {
+static void connOnATResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  if (type == ATResponseType::OK) {
     atFailStreak = 0;
     lastATokMs = millis();
+    connTransition(CONN_CHECK_CNACT, 0);
+    connSendNext();
+  } else {
+    connTransition(CONN_AT_FAIL, 0);
+    connSendNext();
   }
-  if (!gprsIsConnected()) {
-    DEBUG_PRINTLN(F("GPRS not connected. Skipping MQTT check and attempting GPRS reconnection..."));
-    if (gprsConnect()) {
-      mqttConnect();
+}
+
+static void connOnCNACTDisconnectResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  if (type == ATResponseType::OK) {
+    connTransition(CONN_GPRS_ACTIVATE, 1);
+  } else {
+    connTransition(CONN_GPRS_FALLBACK, 0);
+  }
+  connSendNext();
+}
+
+static void connOnCNACTQueryResult(ATResponseType type, const char* response, void* userData) {
+  (void)userData;
+  if (type == ATResponseType::OK && response && strstr(response, "+CNACT:") && strstr(response, ",1,")) {
+    gprsFailStreak = 0;
+    lastGPRSokMs = millis();
+    cntGprsConnects++;
+    connTransition(CONN_MQTT_VERIFY, 0);
+  } else {
+    connTransition(CONN_GPRS_ACTIVATE, 0);
+  }
+  connSendNext();
+}
+
+static void connOnCNACTActivateResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  if (type == ATResponseType::OK) {
+    gprsFailStreak = 0;
+    lastGPRSokMs = millis();
+    cntGprsConnects++;
+    connTransition(CONN_MQTT_VERIFY, 0);
+  } else if (connSubStep < 1) {
+    connTransition(CONN_GPRS_ACTIVATE, connSubStep + 1);
+  } else {
+    connTransition(CONN_GPRS_FALLBACK, 0);
+  }
+  connSendNext();
+}
+
+static void connOnATAfterRestartResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  connWaitingAT = false;
+  if (type == ATResponseType::OK) {
+    lastATokMs = millis();
+    connTransition(CONN_CHECK_CNACT, 0);
+  } else if (millis() - connStateStartMs < 20000UL) {
+    connTransition(CONN_RESTART_WAIT, 0);
+  } else {
+    connTransition(CONN_DONE, 0);
+  }
+  connSendNext();
+}
+
+static void connOnSMDISCResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  (void)type;
+  connTransition(CONN_MQTT_CONNECT, connSubStep);
+  connSendNext();
+}
+
+static void connOnSMCONNResult(ATResponseType type, const char* response, void* userData) {
+  (void)response;
+  (void)userData;
+  if (type == ATResponseType::OK) {
+    cntMqttConnects++;
+    mqttConnected = true;
+    mqttFailStreak = 0;
+    lastMQTTokMs = millis();
+    connTransition(CONN_DONE, 0);
+  } else {
+    DEBUG_PRINTLN(F("AT+SMCONN ERROR. Disconnect then retry MQTT..."));
+    if (connSubStep < 2) {
+      connTransition(CONN_MQTT_DISCONNECT, connSubStep + 1);
+    } else {
+      mqttConnected = false;
+      DEBUG_PRINTLN(F("MQTT failed 3 times. Restarting from beginning..."));
+      connTransition(CONN_RESTART_MODEM, 0);
     }
+  }
+  connSendNext();
+}
+
+static void connSendNext() {
+  switch (connState) {
+    case CONN_IDLE:
+      break;
+    case CONN_CHECK_AT:
+      connResponseBuf[0] = '\0';
+      modem.sendCommand("AT", 2000, connOnATResult, nullptr);
+      break;
+    case CONN_AT_FAIL: {
+      atFailStreak++;
+      if ((millis() - lastATokMs) < RECENT_OK_GRACE_MS && atFailStreak < AT_FAILS_BEFORE_RESTART) {
+        connTransition(CONN_DONE, 0);
+      } else if (atFailStreak < AT_FAILS_BEFORE_RESTART) {
+        connTransition(CONN_DONE, 0);
+      } else if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
+        connTransition(CONN_DONE, 0);
+      } else {
+        connTransition(CONN_RESTART_MODEM, 0);
+      }
+      connSendNext();
+      break;
+    }
+    case CONN_RESTART_MODEM:
+      DEBUG_PRINTLN(F("Modem not responding. Restarting..."));
+      modemRestart();
+      atFailStreak = 0;
+      connWaitingAT = false;
+      connTransition(CONN_RESTART_WAIT, 0);
+      connStateStartMs = millis();
+      break;
+    case CONN_RESTART_WAIT:
+      if (millis() - connStateStartMs > 20000UL) {
+        connTransition(CONN_DONE, 0);
+        connSendNext();
+      } else if (!connWaitingAT) {
+        connWaitingAT = true;
+        modem.sendCommand("AT", 2000, connOnATAfterRestartResult, nullptr);
+      }
+      break;
+    case CONN_CHECK_CNACT:
+      connResponseBuf[0] = '\0';
+      modem.sendCommand("AT+CNACT?", 2500, connOnCNACTQueryResult, nullptr);
+      break;
+    case CONN_GPRS_ACTIVATE: {
+      char cmd[24];
+      if (connSubStep == 0) {
+        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,0", PDP_CID);
+        modem.sendCommand(cmd, 800, connOnCNACTDisconnectResult, nullptr);
+      } else {
+        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,1", PDP_CID);
+        modem.sendCommand(cmd, 10000, connOnCNACTActivateResult, nullptr);
+      }
+      break;
+    }
+    case CONN_GPRS_FALLBACK:
+      if (gprsFailStreak >= GPRS_FAILS_BEFORE_RESTART && (millis() - lastRestartMs) >= MIN_RESTART_GAP_MS) {
+        connTransition(CONN_RESTART_MODEM, 0);
+        gprsFailStreak = 0;
+        connSendNext();
+      } else {
+        gprsFailStreak++;
+        connTransition(CONN_DONE, 0);
+      }
+      break;
+    case CONN_GPRS_WAIT_URC:
+      if (gprsIsConnected()) {
+        gprsFailStreak = 0;
+        lastGPRSokMs = millis();
+        cntGprsConnects++;
+        connTransition(CONN_MQTT_CONFIG, 0);
+        connSendNext();
+      } else if (millis() - connStateStartMs > 10000UL) {
+        connTransition(CONN_GPRS_FALLBACK, 0);
+        connSendNext();
+      }
+      break;
+    case CONN_MQTT_CONFIG: {
+      if (!modem.mqttSetConfig(clientID, mqtt_server, (uint16_t)mqtt_port,
+                              mqtt_username, mqtt_password,
+                              60, topic_pub, "", 0, true, false, true, true)) {
+        mqttConnected = false;
+        connTransition(CONN_DONE, 0);
+      } else {
+        connTransition(CONN_MQTT_CONNECT, 0);
+      }
+      connSendNext();
+      break;
+    }
+    case CONN_MQTT_DISCONNECT:
+      DEBUG_PRINTLN(F("Sending AT+SMDISC before MQTT retry..."));
+      modem.sendCommand("AT+SMDISC", 10000, connOnSMDISCResult, nullptr);
+      break;
+    case CONN_MQTT_CONNECT:
+      if (modem.isMQTTConnected()) modem.mqttDisconnect();
+      DEBUG_PRINTLN(F("Connecting to MQTT broker (async)..."));
+      modem.sendCommand("AT+SMCONN", 30000, connOnSMCONNResult, nullptr);
+      break;
+    case CONN_MQTT_VERIFY:
+      connTransition(CONN_MQTT_CONFIG, 0);
+      connSendNext();
+      break;
+    case CONN_DONE:
+      lastCheck = millis();
+      connState = CONN_IDLE;
+      break;
+    default:
+      connState = CONN_IDLE;
+      break;
+  }
+}
+
+void checkConnections() {
+  if ((long)(millis() - lastCheck) < (long)CHECK_INTERVAL_MS) return;
+  if (!canRunHealthCheck()) return;
+
+  if (connState == CONN_IDLE) {
+    lastCheck = millis();
+    connTransition(CONN_CHECK_AT, 0);
+    connSendNext();
     return;
   }
-  {
-    bool mqttOk = false;
 
-    if (checkMQTTConnection()) {
-      mqttOk = true;
-    } else {
-      DEBUG_PRINTLN(F("MQTT NOT connected. Trying to reconnect up to 3 times..."));
-      for (byte attempt = 0; attempt < 3; attempt++) {
-        mqttConnect();
-        if (mqttConnected) {
-          mqttOk = true;
-          break;
-        }
-        delay(900);
-        WDT_RESET();
-      }
-    }
-
-    if (mqttOk) {
-      mqttFailStreak = 0;
-      lastMQTTokMs = millis();
-      if (DIAG) diagSnapshot("MQTT OK (we ommit GPRS)");
-      return;
-    }
-
-    DEBUG_PRINTLN(F("MQTT still disconnected after tries. Verifying GPRS..."));
-  }
-
-  {
-    bool gprsOk = false;
-    for (byte attempt = 0; attempt < 3; attempt++) {
-      DEBUG_PRINT(F("Verifying GPRS (try number: "));
-      DEBUG_PRINT(attempt + 1);
-      DEBUG_PRINTLN(F(")..."));
-
-      if (gprsIsConnected()) {
-        gprsOk = true;
-        break;
-      }
-      DEBUG_PRINTLN(F("GPRS disconnected. Trying to reconnect..."));
-      if (gprsConnect()) {
-        gprsOk = true;
-        break;
-      }
-
-      delay(700);
-      WDT_RESET();
-    }
-
-    if (!gprsOk) {
-      gprsFailStreak++;
-      DEBUG_PRINT(F("GPRS fail streak = "));
-      DEBUG_PRINTLN(gprsFailStreak);
-
-      if ((millis() - lastGPRSokMs) < RECENT_OK_GRACE_MS && gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
-        DEBUG_PRINTLN(F("GPRS failed but it was OK recently. Do not restart."));
-        return;
-      }
-      if (gprsFailStreak < GPRS_FAILS_BEFORE_RESTART) {
-        DEBUG_PRINTLN(F("GPRS failed under threshold. Retry later."));
-        return;
-      }
-      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
-        DEBUG_PRINTLN(F("GPRS failed; restart blocked by debounce."));
-        return;
-      }
-
-      DEBUG_PRINTLN(F("GPRS failed consistently. Restarting modem..."));
-      modemRestart();
-      gprsFailStreak = 0;
-      if (!gprsConnect()) return;
-
-      DEBUG_PRINTLN(F("GPRS OK after restart. Retrying MQTT..."));
-      mqttConnect();
-      if (mqttConnected) {
-        mqttFailStreak = 0;
-        lastMQTTokMs = millis();
-      } else {
-        mqttFailStreak++;
-      }
-      return;
-    } else {
-      gprsFailStreak = 0;
-      lastGPRSokMs = millis();
-    }
-  }
-
-  {
-    if (!mqttConnected) {
-      DEBUG_PRINTLN(F("GPRS OK. Retrying MQTT after GPRS..."));
-      for (byte attempt = 0; attempt < 3; attempt++) {
-        mqttConnect();
-        if (mqttConnected) {
-          mqttFailStreak = 0;
-          lastMQTTokMs = millis();
-          return;
-        }
-        delay(700);
-        WDT_RESET();
-      }
-
-      mqttFailStreak++;
-      DEBUG_PRINT(F("MQTT fail streak = "));
-      DEBUG_PRINTLN(mqttFailStreak);
-
-      if ((millis() - lastMQTTokMs) < RECENT_OK_GRACE_MS && mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
-        DEBUG_PRINTLN(F("MQTT failed but it was OK recently. Do not restart."));
-        return;
-      }
-      if (mqttFailStreak < MQTT_FAILS_BEFORE_RESTART) {
-        DEBUG_PRINTLN(F("MQTT failed under threshold. Retry later."));
-        return;
-      }
-      if (millis() - lastRestartMs < MIN_RESTART_GAP_MS) {
-        DEBUG_PRINTLN(F("MQTT failed; restart blocked by debounce."));
-        return;
-      }
-
-      DEBUG_PRINTLN(F("MQTT consistently. Restarting modem..."));
-      modemRestart();
-      mqttFailStreak = 0;
-      if (!gprsConnect()) return;
-      mqttConnect();
-      return;
-    } else {
-      mqttFailStreak = 0;
-      lastMQTTokMs = millis();
-      return;
-    }
+  if (connState == CONN_RESTART_WAIT || connState == CONN_GPRS_WAIT_URC) {
+    connSendNext();
   }
 }
 

@@ -52,6 +52,7 @@ bool Sim7070G_AT::begin(uint32_t baudRate) {
 }
 
 void Sim7070G_AT::loop() {
+  Watchdog.reset();
   processRxData();
   processResponse();
   if (_currentCommand && _currentCommand->waiting) {
@@ -115,7 +116,6 @@ bool Sim7070G_AT::sendCommandSync(const char* command, unsigned long timeout,
   ATCommand* sentCmd = &_commandQueue[cmdIndex];
   while ((millis() - startTime) < timeout) {
     loop();
-    Watchdog.reset();
     if (!sentCmd->waiting && sentCmd->responseType != ATResponseType::NONE) {
       if (sentCmd->responseType == ATResponseType::OK) {
         result = true;

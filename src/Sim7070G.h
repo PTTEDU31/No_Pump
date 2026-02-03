@@ -197,6 +197,7 @@ public:
   bool setTimezone(int8_t timezone);
 
   uint32_t getATCommandCount() const { return _atCommandCount; }
+  uint8_t getPendingCommandCount() const { return _at.getPendingCommandCount(); }
   uint32_t getATErrorCount() const { return _atErrorCount; }
   const char* getLastError() const { return _at.getLastError(); }
 
