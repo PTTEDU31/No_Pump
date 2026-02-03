@@ -225,6 +225,58 @@ void Sim7070GDevice::powerPulse()
   }
 }
 
+int Sim7070GDevice::getPreferredPDPCID()
+{
+  if (!_modem)
+    return PDP_CID;
+  char response[384];
+  if (!_modem->sendCommandSync("AT+CGDCONT?", 5000, response, sizeof(response)))
+    return PDP_CID;
+  // Parse +CGDCONT: <cid>,"<type>","<apn>","<ip>",0,0,0
+  // Prefer CID whose APN matches PDP_APN (_apn); else first IP or IPV4V6
+  int matchApnCid = -1;
+  int firstIpCid = -1;
+  const char *line = response;
+  while (line && *line)
+  {
+    const char *p = strstr(line, "+CGDCONT:");
+    if (!p)
+      break;
+    int cid = 0;
+    char type[32] = {0};
+    char apn[80] = {0};
+    if (sscanf(p, "+CGDCONT: %d,\"%31[^\"]\",\"%79[^\"]\"", &cid, type, apn) >= 2)
+    {
+      if (firstIpCid < 0 && (strcmp(type, "IP") == 0 || strcmp(type, "IPV4V6") == 0))
+        firstIpCid = cid;
+      if (matchApnCid < 0 && _apn[0] != '\0' && strcmp(apn, _apn) == 0)
+        matchApnCid = cid;
+    }
+    line = strchr(p, '\n');
+    if (line)
+      line++;
+    else
+      break;
+  }
+  if (matchApnCid >= 0)
+  {
+    DEBUG_PRINT(F("[SIM7070G] CGDCONT? -> CID "));
+    DEBUG_PRINT(matchApnCid);
+    DEBUG_PRINTLN(F(" (APN match)"));
+    return matchApnCid;
+  }
+  if (firstIpCid >= 0)
+  {
+    DEBUG_PRINT(F("[SIM7070G] CGDCONT? -> CID "));
+    DEBUG_PRINT(firstIpCid);
+    DEBUG_PRINTLN(F(" (first IP context)"));
+    return firstIpCid;
+  }
+  DEBUG_PRINT(F("[SIM7070G] CGDCONT? -> fallback PDP_CID "));
+  DEBUG_PRINTLN(PDP_CID);
+  return PDP_CID;
+}
+
 bool Sim7070GDevice::applyBootConfig()
 {
   if (!_modem)
@@ -633,6 +685,7 @@ int Sim7070GDevice::timeout()
       updateState(MODEM_RESET);
       return 200;
     }
+    _modem->checkSendCommandSync("AT+CSCLK=0", "OK", 1000);
     char ip[16];
     if (_modem->getIPAddress(ip, sizeof(ip)))
     {
@@ -644,23 +697,30 @@ int Sim7070GDevice::timeout()
       return 500;
     }
 
-    DEBUG_PRINTLN(F("[SIM7070G] Initiating AT+CNACT=1,1..."));
-    if (_modem->checkSendCommandSync("AT+CNACT=0,1", "OK", 10000))
+    int cid = getPreferredPDPCID();
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,1", cid);
+    DEBUG_PRINT(F("[SIM7070G] Initiating "));
+    DEBUG_PRINT(cmd);
+    DEBUG_PRINTLN(F(" (CID from AT+CGDCONT?)..."));
+    if (_modem->checkSendCommandSync(cmd, "OK", 10000))
     {
-      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 success"));
+      DEBUG_PRINT(F("[SIM7070G] CNACT="));
+      DEBUG_PRINT(cid);
+      DEBUG_PRINTLN(F(",1 success"));
       updateState(MODEM_WAIT_FOR_IP_FIRST);
       _retryCount = 0;
       return 7000; // Wait 7 seconds
     }
     else
     {
-      DEBUG_PRINTLN(F("[SIM7070G] CNACT=1,1 failed, retrying..."));
+      DEBUG_PRINTLN(F("[SIM7070G] CNACT failed, retrying..."));
       _retryCount++;
       if (_retryCount >= 3)
       {
-        // After 3 failures, switch to apply boot config
         DEBUG_PRINTLN(F("[SIM7070G] CNACT failed after 3 attempts, switching to boot config"));
-        _modem->checkSendCommandSync("AT+CNACT=0,0", "OK", 10000);
+        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,0", cid);
+        _modem->checkSendCommandSync(cmd, "OK", 10000);
         updateState(MODEM_APPLY_BOOT_CONFIG);
         _retryCount = 0;
         return DURATION_IMMEDIATELY;

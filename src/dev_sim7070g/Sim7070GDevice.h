@@ -143,6 +143,8 @@ private:
   // Internal methods
   bool applyBootConfig();
   bool checkModemAlive();
+  /** Query AT+CGDCONT? and return preferred CID (match PDP_APN or first IP/IPV4V6); fallback PDP_CID */
+  int getPreferredPDPCID();
   void updateState(ModemState newState);
   void handleIncomingData();
   void onMqttMessage(const char* topic, const uint8_t* payload, uint32_t len);

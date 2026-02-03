@@ -137,7 +137,7 @@ extern const int mqtt_port;
 
 
 // SIM7070G Configuration
-#define MODEM_BAUD_RATE 19200
+#define MODEM_BAUD_RATE 115200
 #define MODEM_POWER_PIN 12
 
 // Network configuration
