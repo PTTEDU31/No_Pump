@@ -6,12 +6,7 @@
 #include <ChaChaPoly.h>
 #include "config.h"
 
-// Forward declaration
 class Sim7070G;
-
-// =========================================================================
-// HEX ENCODING/DECODING
-// =========================================================================
 
 /**
  * Encode binary data to hexadecimal string
@@ -32,10 +27,6 @@ void hexEncode(const uint8_t* in, size_t inLen, char* out, size_t outCap, bool u
  * @return true if successful, false otherwise
  */
 bool hexDecode(const char* hex, uint8_t* out, size_t outCap, size_t& outLen);
-
-// =========================================================================
-// JSON PARSING HELPERS
-// =========================================================================
 
 /**
  * Get string value from JSON
@@ -73,10 +64,6 @@ bool jsonGetInt(const char* json, const char* key, long& out);
  * @return true if found and extracted, false otherwise
  */
 bool jsonGetFloat(const char* json, const char* key, float& out);
-
-// =========================================================================
-// CRYPTO FUNCTIONS
-// =========================================================================
 
 /**
  * Generate 12-byte nonce from network time
@@ -125,10 +112,6 @@ size_t encryptPayload(const char* plaintext, uint8_t* ciphertext, uint8_t tag[16
  */
 bool decryptPayload(const uint8_t* ciphertext, size_t ctLen, const uint8_t tag[16], 
                     const uint8_t nonce12[12], char* outPlain, size_t outPlainCap);
-
-// =========================================================================
-// NETWORK TIME HELPERS
-// =========================================================================
 
 /**
  * Get network time in ISO-8601 format (YYYY-MM-DDTHH:MM:SSZ)

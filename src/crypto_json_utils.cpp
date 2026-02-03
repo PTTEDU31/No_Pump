@@ -5,16 +5,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// External crypto key (defined in main.cpp)
 extern const char* CRYPTOKEY;
 
-// Static crypto key buffer (decoded from hex)
 static uint8_t CRYPTO_KEY[32];
 static bool cryptoKeyInitialized = false;
-
-// =========================================================================
-// HEX ENCODING/DECODING
-// =========================================================================
 
 void hexEncode(const uint8_t* in, size_t inLen, char* out, size_t outCap, bool uppercase) {
   static const char* TAB_U = "0123456789ABCDEF";
@@ -57,10 +51,6 @@ bool hexDecode(const char* hex, uint8_t* out, size_t outCap, size_t& outLen) {
   outLen = bytes;
   return true;
 }
-
-// =========================================================================
-// JSON PARSING HELPERS
-// =========================================================================
 
 bool jsonGetString(const char* json, const char* key, char* out, size_t cap) {
   const char* p = strstr(json, key);
@@ -117,10 +107,6 @@ bool jsonGetFloat(const char* json, const char* key, float& out) {
   return true;
 }
 
-// =========================================================================
-// CRYPTO FUNCTIONS
-// =========================================================================
-
 static void initCryptoKey() {
   if (cryptoKeyInitialized) return;
   
@@ -140,7 +126,7 @@ static void initCryptoKey() {
 }
 
 void makeNonce12(uint8_t nonce[12]) {
-  static uint64_t perSecondCtr = 0;  // 40-bit used
+  static uint64_t perSecondCtr = 0;
   static uint16_t lastY = 0;
   static uint8_t lastM = 0;
   static uint8_t lastD = 0;
@@ -194,7 +180,6 @@ void makeNonce12(uint8_t nonce[12]) {
   nonce[11] = (uint8_t)(c & 0xFF);
 }
 
-// Overloaded version that uses modem instance to get network time
 void makeNonce12(uint8_t nonce[12], Sim7070G* modem) {
   static uint64_t perSecondCtr = 0;
   static uint16_t lastY = 0;
@@ -286,10 +271,6 @@ bool decryptPayload(const uint8_t* ciphertext, size_t ctLen, const uint8_t tag[1
   return ok;
 }
 
-// =========================================================================
-// NETWORK TIME HELPERS
-// =========================================================================
-
 static GetCCLKResponseFn g_getCCLKResponse = nullptr;
 
 void setGetCCLKResponse(GetCCLKResponseFn fn) {
@@ -304,7 +285,7 @@ bool getNetworkTimeISO8601(char* isoOut, size_t outCap) {
 }
 
 bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap) {
-  if (!cclkResp || !isoOut || outCap < 21) return false;  // "YYYY-MM-DDTHH:MM:SSZ"+NUL
+  if (!cclkResp || !isoOut || outCap < 21) return false;
 
   const char* p = strchr(cclkResp, '\"');
   if (!p) return false;

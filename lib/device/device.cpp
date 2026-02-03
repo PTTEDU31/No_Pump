@@ -1,14 +1,11 @@
 #include <Arduino.h>
 #include "device.h"
 
-// For SAMD21 (Arduino Nano 33 IoT) - single core architecture
 #define CURRENT_CORE 0
 
-// Device class implementation
 Device::Device(uint32_t subscribeEvents, int8_t core)
     : subscribeEvents(subscribeEvents), core(core) {}
 
-// DeviceManager implementation
 DeviceManager &DeviceManager::getInstance()
 {
   static DeviceManager instance;
@@ -60,7 +57,6 @@ int DeviceManager::devicesUpdate(unsigned long now)
   eventFired[0] = 0;
   bool handleEvents = events != 0;
 
-  // Handle events
   if (handleEvents)
   {
     for (size_t i = 0; i < deviceCount; i++)
@@ -77,7 +73,6 @@ int DeviceManager::devicesUpdate(unsigned long now)
     }
   }
 
-  // Handle timeouts
   int smallest_delay = DURATION_NEVER;
   for (size_t i = 0; i < deviceCount; i++)
   {

@@ -3,10 +3,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// duration constants which can be returned from start(), event() or timeout()
-#define DURATION_IGNORE -2      // when returned from event() does not update the current timeout
-#define DURATION_NEVER -1       // timeout() will not be called, only event()
-#define DURATION_IMMEDIATELY 0  // timeout() will be called each loop
+#define DURATION_IGNORE -2
+#define DURATION_NEVER -1
+#define DURATION_IMMEDIATELY 0
 
 enum deviceEvent_t {
     EVENT_NONE = 0,
@@ -16,7 +15,6 @@ enum deviceEvent_t {
     EVENT_MODEL_SELECTED = 1 << 5,
     EVENT_CONNECTION_CHANGED = 1 << 6,
 
-    // Network connectivity events
     EVENT_WIFI_CONNECTED = 1 << 7,
     EVENT_WIFI_DISCONNECTED = 1 << 8,
     EVENT_WIFI_RECONNECTING = 1 << 9,
@@ -26,7 +24,6 @@ enum deviceEvent_t {
     EVENT_NETWORK_FAST = 1 << 13,        // Good network speed restored
     EVENT_NETWORK_TIMEOUT = 1 << 14,     // Network timeout/unreachable
 
-    // Configuration events
     EVENT_CONFIG_MODEL_CHANGED = 1 << 16,
     EVENT_CONFIG_MOTION_CHANGED = 1 << 20,
     EVENT_CONFIG_BUTTON_CHANGED = 1 << 21,
@@ -168,7 +165,6 @@ private:
     unsigned long deviceTimeout[16] = {0};  // Use unsigned long for millis()
 };
 
-// Convenience functions for backward compatibility
 inline void devicesRegister(Device** devices, uint8_t count) {
     DeviceManager::getInstance().registerDevices(devices, count);
 }

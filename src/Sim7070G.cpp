@@ -63,8 +63,6 @@ bool Sim7070G::begin()
   {
     return false;
   }
-
-  // Register URC handlers
   _at.registerURCHandler("+SMSTATE", onURC_SMSTATE);
   _at.registerURCHandler("+SMPUB", onURC_SMPUB);
   _at.registerURCHandler("+SMSUB", onURC_SMSUB);
@@ -111,13 +109,11 @@ bool Sim7070G::isAlive(unsigned long timeout)
 
 bool Sim7070G::checkSIM()
 {
-  // Check if SIM is ready - response should contain "READY"
   return checkSendCommandSync("AT+CPIN?", "READY", 1000);
 }
 
 bool Sim7070G::setPreferredRAT(uint8_t rat)
 {
-  // AT+CMNB: 1=CAT-M, 2=NB-IoT, 3=CAT-M and NB-IoT
   char cmd[32];
   snprintf(cmd, sizeof(cmd), "AT+CMNB=%d", rat);
   return checkSendCommandSync(cmd, "OK", 5000);
@@ -125,7 +121,6 @@ bool Sim7070G::setPreferredRAT(uint8_t rat)
 
 bool Sim7070G::setNetworkMode(uint8_t mode)
 {
-  // AT+CNMP: 2=Automatic, 13=GSM only, 38=LTE only, 51=GSM and LTE only
   char cmd[32];
   snprintf(cmd, sizeof(cmd), "AT+CNMP=%d", mode);
   return checkSendCommandSync(cmd, "OK", 5000);
@@ -138,8 +133,6 @@ bool Sim7070G::getSignalQuality(int8_t *rssi, uint8_t *ber)
   {
     return false;
   }
-
-  // Parse +CSQ: <rssi>,<ber>
   int r, b;
   if (sscanf(response, "+CSQ: %d,%d", &r, &b) == 2)
   {
@@ -162,8 +155,6 @@ bool Sim7070G::getNetworkRegistration(NetworkRegStatus *status)
   {
     return false;
   }
-
-  // Parse +CGREG: <n>,<stat>
   int n, stat;
   if (sscanf(response, "+CGREG: %d,%d", &n, &stat) == 2)
   {
@@ -206,8 +197,6 @@ bool Sim7070G::getAPN(char *apn, size_t len)
   {
     return false;
   }
-
-  // Parse +CGNAPN: <index>,<APN>
   int index;
   char apnName[64];
   if (sscanf(response, "+CGNAPN: %d,\"%63[^\"]\"", &index, apnName) == 2)
@@ -235,7 +224,6 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
   char cmd[256];
   char response[256];
 
-  // Step 1: Disable RF - AT+CFUN=0
   DEBUG_PRINTLN(F("[APN] Step 1: Disabling RF..."));
   if (!_at.sendCommandSync("AT+CFUN=0", 5000))
   {
@@ -244,9 +232,6 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
   }
   DEBUG_PRINTLN(F("[APN] RF disabled"));
   delay(500);
-
-  // Step 2: Set APN manually - AT+CGDCONT=<cid>,"IP","<apn>"
-  // Some operators need to set APN first when registering the network
   DEBUG_PRINT(F("[APN] Step 2: Setting APN manually (CID="));
   DEBUG_PRINT(cid);
   DEBUG_PRINT(F(", APN="));
@@ -256,14 +241,11 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
   if (!_at.sendCommandSync(cmd, 5000))
   {
     DEBUG_PRINTLN(F("[APN] Failed to set APN manually"));
-    // Try to enable RF anyway
     _at.sendCommandSync("AT+CFUN=1", 5000);
     return false;
   }
   DEBUG_PRINTLN(F("[APN] APN set manually"));
   delay(500);
-
-  // Step 3: Enable RF - AT+CFUN=1
   DEBUG_PRINTLN(F("[APN] Step 3: Enabling RF..."));
   if (!_at.sendCommandSync("AT+CFUN=1", 10000))
   {
@@ -271,20 +253,17 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
     return false;
   }
   DEBUG_PRINTLN(F("[APN] RF enabled"));
-  delay(2000); // Wait for SIM to be ready after RF enable
-
-  // Step 4: Check PS service - AT+CGATT?
+  delay(2000);
   DEBUG_PRINTLN(F("[APN] Step 4: Checking PS service attachment..."));
   unsigned long startTime = millis();
   bool psAttached = false;
   while ((millis() - startTime) < 30000)
-  { // Wait up to 30 seconds
+  {
     if (!_at.sendCommandSync("AT+CGATT?", 5000, response, sizeof(response)))
     {
       delay(1000);
       continue;
     }
-    // Parse +CGATT: <state> (1 indicates PS has attached)
     int cgattState = 0;
     if (sscanf(response, "+CGATT: %d", &cgattState) == 1)
     {
@@ -312,17 +291,11 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
     DEBUG_PRINT(F("[APN] Network APN: "));
     DEBUG_PRINTLN(networkAPN);
   }
-
-  // Step 6: Set APN configuration - AT+CNCFG=<cid>,<type>,<apn>
-  // Use provided APN (network APN may be empty under GSM network)
   DEBUG_PRINT(F("[APN] Step 6: Setting APN configuration (CID="));
   DEBUG_PRINT(cid);
   DEBUG_PRINT(F(", APN="));
   DEBUG_PRINT(apn);
   DEBUG_PRINTLN(F(")..."));
-
-  // AT+CNCFG=<cid>,<type>,<apn>[,<username>,<password>]
-  // type: 1 = IPv4, 2 = IPv6, 3 = IPv4v6
   if (username && password && strlen(username) > 0 && strlen(password) > 0)
   {
     snprintf(cmd, sizeof(cmd), "AT+CNCFG=%d,%d,\"%s\",\"%s\",\"%s\"", cid, 1, apn, username, password);
@@ -339,7 +312,6 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
   }
   DEBUG_PRINTLN(F("[APN] APN configuration set successfully"));
 
-  // Save APN information
   strncpy(_apn, apn, sizeof(_apn) - 1);
   _apn[sizeof(_apn) - 1] = '\0';
   if (username)
@@ -360,7 +332,6 @@ bool Sim7070G::setAPN(uint8_t cid, const char *apn, const char *username, const 
   {
     _apnPassword[0] = '\0';
   }
-
   DEBUG_PRINTLN(F("[APN] APN set successfully"));
   return true;
 }
@@ -372,8 +343,6 @@ bool Sim7070G::getSystemInfo(char *info, size_t len)
   {
     return false;
   }
-
-  // Parse +CPSI: <system>,<operator>,<long_eons>,<short_eons>,<rat>,<mcc>,<mnc>,<lac>,<cell_id>,<ch>,<rssi>,<sinr>
   if (info && len > 0)
   {
     strncpy(info, response, len - 1);
@@ -387,12 +356,10 @@ Sim7070GState Sim7070G::getState()
 {
   return _state;
 }
-// Part 1: Steps 1-3 - Initial preparation (SIM, RF signal, PS service)
 bool Sim7070G::attacthService()
 {
   char response[256];
 
-  // Step 1: Check SIM card status - AT+CPIN?
   DEBUG_PRINTLN(F("[PDP] Step 1: Checking SIM card status..."));
   if (!checkSIM())
   {
@@ -687,7 +654,6 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", _mqttUsername);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
-    delay(200);
   }
   // Set password if provided
   if (_mqttPassword[0] != '\0')
@@ -695,55 +661,41 @@ bool Sim7070G::mqttSetConfig(const char *clientId, const char *server, uint16_t 
     snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", _mqttPassword);
     if (!checkSendCommandSync(cmd, "OK", 5000))
       return false;
-    delay(200);
   }
   // Set client ID
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", _mqttClientId);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
   // Set keepalive
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"KEEPTIME\",%d", _mqttKeepalive);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
   // Set server URL
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\",\"%d\"", _mqttServer, _mqttPort);
-  if (!checkSendCommandSync(cmd, "OK", 20000))
+  if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(200);
-
   // Set clean session
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLEANSS\",%d", _mqttCleanSession ? 1 : 0);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
-
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"TOPIC\",\"%s\"", topic);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(300);
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"MESSAGE\",\"%s\"", message);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
-
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"QOS\",%d", qos);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"SUBHEX\",%d", subhex ? 1 : 0);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"RETAIN\",%d", retain ? 1 : 0);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
   snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"ASYNCMODE\",%d", asyncmode ? 1 : 0);
   if (!checkSendCommandSync(cmd, "OK", 5000))
     return false;
-  delay(100);
 
   return true;
 }

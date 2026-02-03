@@ -1,7 +1,7 @@
 #include <Arduino.h>
-// ----------------- CONFIG DEBUG/DIAGNOSTIC -----------------
-#define DEBUG true  // <--- Put false to silence the serial prints in the monitor
-#define DIAG false  // <--- Put false to silence the detailed diagnostics
+
+#define DEBUG true
+#define DIAG false
 
 #if DEBUG
 #define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)

@@ -198,8 +198,8 @@ static inline bool isPumpOn();
 static inline void armStartProtection(const char* motivo);
 static inline void serviceStartProtection();
 
-bool syncTimeUTC_viaCNTP(uint8_t cid = 1, const char* server = "time.google.com", uint32_t waitTotalMs = 12000UL);
-bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs = 12000UL);
+bool syncTimeUTC_viaCNTP(uint8_t timeZone, const char* server, uint32_t waitTotalMs);
+bool syncTimeUTC_any(uint8_t timeZone, uint32_t waitTotalMs);
 
 
 int getCSQ_RSSI();       // returns 0..31; -1 if unknown
@@ -556,7 +556,7 @@ static inline void serviceStartProtection() {
 // MODEM CONFIGURATION
 static inline void applyBootConfig() {
   //sendAT("ATE0", 150);
-  sendAT("AT+CMEE=2", 120);
+  // sendAT("AT+CMEE=2", 120);
   sendAT("AT+CSCLK=0", 150);
 }
 
@@ -1072,8 +1072,7 @@ bool gprsConnect() {
     cntGprsConnects++;
 
 
-    // --- Synchronize UTC time via multiple NTP servers ---
-    syncTimeUTC_any(PDP_CID, 12000UL);
+    syncTimeUTC_any(0, 12000UL);
 
     return true;
   }
@@ -1142,8 +1141,7 @@ bool gprsConnect() {
       lastGPRSokMs = millis();
       cntGprsConnects++;
 
-      // --- Synchronize UTC time via multiple NTP servers ---
-      syncTimeUTC_any(PDP_CID, 12000UL);
+      syncTimeUTC_any(0, 12000UL);
 
       return true;
     }
@@ -1187,7 +1185,7 @@ void sendAT(const char* command, unsigned long wait) {
   readResponse();
 }
 
-bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) {
+bool syncTimeUTC_viaCNTP(uint8_t timeZone, const char* server, uint32_t waitTotalMs) {
   char buf[128] = { 0 };
   char cmd[96];
   char timeBefore[160] = { 0 };
@@ -1196,20 +1194,21 @@ bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) 
   DEBUG_PRINT(F("[NTP] Synchronizing with server: "));
   DEBUG_PRINTLN(server);
 
-  // Capture time BEFORE sync attempt
-  sendCommandGetResponse("AT+CCLK?", timeBefore, sizeof(timeBefore), 1200);
+  sendCommandGetResponse("AT+CCLK?", timeBefore, sizeof(timeBefore), 5000);
 
-  // Configure NTP server
-  snprintf(cmd, sizeof(cmd), "AT+CNTPCID=%u", cid);
-  sendCommandGetResponse(cmd, buf, sizeof(buf), 1200);
+  snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",%d", server, (int)timeZone);
+  sendCommandGetResponse(cmd, buf, sizeof(buf), 5000);
+  if (strstr(buf, "OK") == nullptr) {
+    DEBUG_PRINTLN(F("[NTP] Failed to configure NTP server"));
+    return false;
+  }
 
-  snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",0", server);
-  sendCommandGetResponse(cmd, buf, sizeof(buf), 1500);
+  sendCommandGetResponse("AT+CNTP", buf, sizeof(buf), 5000);
+  if (strstr(buf, "OK") == nullptr) {
+    DEBUG_PRINTLN(F("[NTP] Failed to trigger NTP sync"));
+    return false;
+  }
 
-  // Trigger NTP sync
-  sendCommandGetResponse("AT+CNTP", buf, sizeof(buf), 1500);
-
-  // Poll for result
   bool ok = false;
   bool explicitFailure = false;
   unsigned long t0 = millis();
@@ -1217,19 +1216,47 @@ bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) 
   while (millis() - t0 < waitTotalMs) {
     memset(buf, 0, sizeof(buf));
     sendCommandGetResponse("AT+CNTP?", buf, sizeof(buf), 900);
-
-    // Check for success
-    if (strstr(buf, "+CNTP: 1")) {
-      ok = true;
-      DEBUG_PRINTLN(F("[NTP] Sync successful!"));
-      break;
+    if (strstr(buf, "OK") == nullptr) {
+      delay(600);
+      WDT_RESET();
+      continue;
     }
 
-    // Check for explicit failure
-    if (strstr(buf, "+CNTP: 0")) {
-      explicitFailure = true;
-      DEBUG_PRINTLN(F("[NTP] Explicit failure (+CNTP: 0)"));
-      break;
+    const char* cntpPtr = strstr(buf, "+CNTP:");
+    if (cntpPtr) {
+      cntpPtr += 6;
+      while (*cntpPtr == ' ' || *cntpPtr == '\t') cntpPtr++;
+
+      int simpleStatus = -1;
+      if (sscanf(cntpPtr, "%d", &simpleStatus) == 1) {
+        if (simpleStatus == 1) {
+          ok = true;
+          DEBUG_PRINTLN(F("[NTP] Sync successful! (simple format)"));
+          break;
+        }
+        if (simpleStatus == 0) {
+          explicitFailure = true;
+          DEBUG_PRINTLN(F("[NTP] Explicit failure (+CNTP: 0)"));
+          break;
+        }
+      } else {
+        char serverName[64];
+        int tz = -1, offset = 0, mode = -1;
+        if (sscanf(cntpPtr, "\"%63[^\"]\",%d,%d,%d", serverName, &tz, &offset, &mode) == 4 ||
+            sscanf(cntpPtr, "%63[^,],%d,%d,%d", serverName, &tz, &offset, &mode) == 4) {
+          if (mode == 2) {
+            ok = true;
+            DEBUG_PRINTLN(F("[NTP] Sync successful! (mode=2)"));
+            break;
+          }
+          if (mode != 0) {
+            explicitFailure = true;
+            DEBUG_PRINT(F("[NTP] Error mode: "));
+            DEBUG_PRINTLN(mode);
+            break;
+          }
+        }
+      }
     }
 
     if (strstr(buf, "ERROR") || strstr(buf, "+CME ERROR")) {
@@ -1246,14 +1273,9 @@ bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) 
     DEBUG_PRINTLN(F("[NTP] Timeout waiting for response"));
   }
 
-  // Capture time AFTER sync attempt
   sendCommandGetResponse("AT+CCLK?", timeAfter, sizeof(timeAfter), 1200);
-
-  // Verify time actually changed (additional validation)
   if (ok && strcmp(timeBefore, timeAfter) == 0) {
     DEBUG_PRINTLN(F("[NTP] Warning: Time didn't change after NTP sync"));
-    // You might want to treat this as a failure:
-    // ok = false;
   }
 
   DEBUG_PRINT(F("[NTP] Time before: "));
@@ -1271,15 +1293,11 @@ bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) 
   return ok;
 }
 
-// Try several NTP servers in order until one works
-bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs) {
-  // Order them by preference
+bool syncTimeUTC_any(uint8_t timeZone, uint32_t waitTotalMs) {
   const char* servers[] = {
     "time.google.com",
     "time.cloudflare.com",
     "pool.ntp.org",
-    "time.windows.com",
-    "time.nist.gov"
   };
   const size_t nServers = sizeof(servers) / sizeof(servers[0]);
 
@@ -1287,7 +1305,7 @@ bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs) {
     DEBUG_PRINT(F("[NTP] Trying server: "));
     DEBUG_PRINTLN(servers[i]);
 
-    if (syncTimeUTC_viaCNTP(cid, servers[i], waitTotalMs)) {
+    if (syncTimeUTC_viaCNTP(timeZone, servers[i], waitTotalMs)) {
       DEBUG_PRINT(F("[NTP] Time synchronized using: "));
       DEBUG_PRINTLN(servers[i]);
       return true;
