@@ -1,0 +1,41 @@
+[33mcommit c2fde0123ac5cf9cb9c24ece024c11aafc6f8976[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mino-base[m[33m, [m[1;31morigin/ino-base[m[33m)[m
+Author: TU31 <tungpt.tech@stepup.com.vn>
+Date:   Tue Feb 3 15:05:55 2026 +0700
+
+    AT Command lib and config.h
+
+[33mcommit 5b62930992e3bd9f748c14274e60fdab2cc05edc[m
+Author: TU31 <tungpt.tech@stepup.com.vn>
+Date:   Mon Jan 26 02:02:17 2026 +0700
+
+    base
+
+[33mcommit 081b2e853610fea3a5f048f710a7536d0327f3f0[m
+Author: PTTEDU31 <247140231066@hpu2.edu.vn>
+Date:   Thu Jan 22 03:54:40 2026 +0700
+
+    update gitinore
+
+[33mcommit cdb17fceb45fb10eb9a4f4f30c4fd968216ea474[m
+Author: PTTEDU31 <247140231066@hpu2.edu.vn>
+Date:   Thu Jan 22 03:53:24 2026 +0700
+
+    clear
+
+[33mcommit 17c34f21ff013edf59595d747059414c81be8570[m
+Author: PTTEDU31 <247140231066@hpu2.edu.vn>
+Date:   Thu Jan 22 03:38:31 2026 +0700
+
+    sim
+
+[33mcommit 1533d08aae208c28868c3eb7b3bdc42378b253b9[m
+Author: PTTEDU31 <247140231066@hpu2.edu.vn>
+Date:   Wed Jan 21 03:22:44 2026 +0700
+
+    Sim7070 init
+
+[33mcommit d3a76c37660a1c5cbeb523cfb5d13fe18cd2a706[m
+Author: PTTEDU31 <247140231066@hpu2.edu.vn>
+Date:   Wed Jan 21 03:16:29 2026 +0700
+
+    first commit

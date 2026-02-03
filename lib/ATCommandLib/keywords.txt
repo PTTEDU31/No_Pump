@@ -1,0 +1,53 @@
+#######################################
+# Syntax Coloring Map For ATCommandLib
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+ATCommandManager	KEYWORD1
+ATResponseType	KEYWORD1
+ATCallback	KEYWORD1
+URCHandler	KEYWORD1
+ATCommand	KEYWORD1
+URCEntry	KEYWORD1
+ATStats	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+loop	KEYWORD2
+sendCommandAsync	KEYWORD2
+sendCommandSync	KEYWORD2
+registerURCHandler	KEYWORD2
+unregisterURCHandler	KEYWORD2
+isAlive	KEYWORD2
+clearQueue	KEYWORD2
+getPendingCommandCount	KEYWORD2
+isCommandActive	KEYWORD2
+getStats	KEYWORD2
+resetStats	KEYWORD2
+setDebug	KEYWORD2
+setCustomTerminator	KEYWORD2
+clearCustomTerminator	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+OK	LITERAL1
+ERROR	LITERAL1
+TIMEOUT	LITERAL1
+NONE	LITERAL1
+CUSTOM	LITERAL1
+URC	LITERAL1
+DATA	LITERAL1
+
+AT_QUEUE_SIZE	LITERAL1
+AT_MAX_URC_HANDLERS	LITERAL1
+AT_RX_BUFFER_SIZE	LITERAL1
+AT_MAX_CMD_LENGTH	LITERAL1
+AT_MAX_RESPONSE_LENGTH	LITERAL1

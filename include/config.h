@@ -113,4 +113,29 @@ extern const int mqtt_port;
 #define SIM_WAIT_MS 1000
 #define ON_PULSE_MS 5000
 
+// =========================================================================
+// AT COMMAND LIBRARY CONFIGURATION
+// =========================================================================
+#define AT_QUEUE_SIZE 8                    // Command queue size (circular buffer)
+#define AT_MAX_URC_HANDLERS 16             // Maximum number of URC handlers
+#define AT_RX_BUFFER_SIZE 512              // RX buffer size for line-by-line processing
+#define AT_MAX_CMD_LENGTH 128              // Maximum AT command length
+#define AT_MAX_RESPONSE_LENGTH 512         // Maximum response buffer length
+
+// =========================================================================
+// MODEM SERIAL CONFIGURATION
+// =========================================================================
+#define MODEM_BAUD_RATE 115200             // Modem serial baud rate
+#define MODEM_POWER_PIN MODEM_PWR_PIN      // Alias for consistency
+
+// =========================================================================
+// MQTT KEEPALIVE
+// =========================================================================
+#define MQTT_KEEPALIVE_SEC 60              // MQTT keepalive interval in seconds
+
+// =========================================================================
+// MQTT BUFFER CONFIGURATION (for Sim7070GDevice)
+// =========================================================================
+#define MQTT_BUFFER_SIZE 4                 // Number of messages that can be buffered
+
 #endif // CONFIG_H
