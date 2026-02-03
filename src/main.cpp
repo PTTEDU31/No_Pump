@@ -7,6 +7,7 @@
 #include <math.h>
 #include "wiring_private.h"
 #include "config.h"
+#include "ATCommandLib.h"
 ///////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////
 // Change the secrets from the portal to the following fields in the corresponding variables
@@ -78,6 +79,9 @@ char mqtt_password[64];
 // ====== CRYPTO =======
 static const char* KEY_HEX = CRYPTOKEY;
 static uint8_t CRYPTO_KEY[32];
+
+// ----------------- AT COMMAND MANAGER -----------------
+ATCommandManager* atManager = nullptr;
 
 // ----------------- MQTT STATE -----------------
 bool mqttConnected = false;
@@ -194,7 +198,9 @@ struct modbus_transmit {
 
 
 // ----------------- PROTOTYPES -----------------
-void sendAT(const char* command, unsigned long wait = 100);  // Sends command AT to the modem
+// DEPRECATED: Use atManager->sendCommandSync() or sendCommandAsync() instead
+// Kept for backward compatibility during migration
+void sendAT(const char* command, unsigned long wait = 100);
 bool sendATwaitOK(const char* cmd, char* out, size_t outCap, unsigned long overallMs = 2500);
 void sendCommandGetResponse(const char* command, char* response, size_t maxLen, unsigned long timeout = 1200);
 void readResponse();
@@ -204,9 +210,16 @@ bool checkMQTTConnection();
 bool publishMessage();
 bool gprsConnect();
 bool gprsIsConnected();
-void handleMQTTMessages();
 void flushSIMBuffer();
 void checkConnections();
+
+// URC HANDLERS (ATCommandLib callbacks)
+void onMQTTMessageURC(const char* prefix, const char* data, void* userData);
+void onMQTTStateURC(const char* prefix, const char* data, void* userData);
+void onPDPContextURC(const char* prefix, const char* data, void* userData);
+
+// HELPER: Process encrypted MQTT command
+void processMQTTCommand(const char* hexPayload);
 void turnOnPump();
 void turnOffPump();
 void verifySIMConnected();
@@ -317,242 +330,374 @@ void setup() {
   // POWER INITIAL STATE (MAIN LINE)
   prevPwrOn = isPwrPresent();
 
-  DEBUG_PRINTLN(F("Production_Node_Nano33IoT (115200 bps, CID=1)"));
+  DEBUG_PRINTLN(F("Production_Node_Nano33IoT (115200 bps)"));
   delay(500);
   WDT_RESET();
 
-  DEBUG_PRINTLN(F("Verifying communication with the SIM7070G"));
-  verifySIMConnected();
-
-  applyBootConfig();
-
-  DEBUG_PRINTLN(F("Initializing SIM7070G..."));
-
-  gprsConnect();
-
-  delay(1000);
-
+  // ========== INITIALIZE AT COMMAND MANAGER ==========
+  DEBUG_PRINTLN(F("[INIT] Creating AT Command Manager..."));
+  atManager = new ATCommandManager(&sim7070);
+  
+  if (!atManager->begin()) {
+    DEBUG_PRINTLN(F("[ERROR] Failed to initialize AT Command Manager!"));
+    while(1) {
+      WDT_RESET();
+      delay(1000);
+    }
+  }
+  
+  // Enable debug for AT commands
+  atManager->setDebug(DEBUG);
+  
+  DEBUG_PRINTLN(F("[INIT] AT Command Manager initialized"));
+  
+  // ========== REGISTER URC HANDLERS ==========
+  DEBUG_PRINTLN(F("[INIT] Registering URC handlers..."));
+  atManager->registerURCHandler("+SMSUB:", onMQTTMessageURC);
+  atManager->registerURCHandler("+SMSTATE:", onMQTTStateURC);
+  atManager->registerURCHandler("+APP PDP:", onPDPContextURC);
+  DEBUG_PRINTLN(F("[INIT] URC handlers registered"));
+  
   WDT_RESET();
 
+  // Setup MQTT topics
   snprintf(topic_sub, sizeof(topic_sub), "xtr/server/%s", NODE_ID);
   snprintf(topic_pub, sizeof(topic_pub), "xtr/nodes/%s", NODE_ID);
   snprintf(clientID, sizeof(clientID), "%s", NODE_ID);
-
   snprintf(mqtt_username, sizeof(mqtt_username), "%s", USERNAME);
   snprintf(mqtt_password, sizeof(mqtt_password), "%s", PASSWORD);
+  
+  DEBUG_PRINT(F("[MQTT] Subscribe topic: "));
+  DEBUG_PRINTLN(topic_sub);
+  DEBUG_PRINT(F("[MQTT] Publish topic: "));
+  DEBUG_PRINTLN(topic_pub);
 
+  // ========== MODEM INITIALIZATION (Non-blocking via ATCommandLib) ==========
+  DEBUG_PRINTLN(F("[INIT] Starting modem initialization..."));
+  verifySIMConnected();
+  applyBootConfig();
+  
+  WDT_RESET();
+  
+  DEBUG_PRINTLN(F("[INIT] Initializing GPRS..."));
+  gprsConnect();
+  
+  delay(1000);  // Small delay for initial connection
+  WDT_RESET();
+  
+  DEBUG_PRINTLN(F("[INIT] Connecting to MQTT..."));
   mqttConnect();
 
   WDT_RESET();
-  DEBUG_PRINTLN("Leaving Setup");
+  DEBUG_PRINTLN(F("[INIT] Setup complete - Entering main loop"));
+  DEBUG_PRINTLN(F("[INFO] URC handlers will process MQTT messages automatically"));
 }
 
 // ----------------- LOOP -----------------
 void loop() {
-
+  unsigned long now = millis();
   WDT_RESET();
+  
+  // ========== CRITICAL: Process AT commands and URCs ==========
+  // This MUST be called first and frequently to handle async operations
+  if (atManager) {
+    atManager->loop();
+  }
+  
+  // ========== Service pump protection ==========
   serviceStartProtection();
 
-  handleMQTTMessages();
-
+  // ========== handleMQTTMessages() REMOVED ==========
+  // MQTT messages are now handled automatically by URC handler: onMQTTMessageURC()
+  // This eliminates the need for polling sim7070.available()
+  
+  // ========== Check connections ==========
   checkConnections();
 
+  // ========== Service pump edge and status ==========
   servicePumpEdgeAndStatus();
 
-  //DEBUG_PRINT("Pump On?: ");
-  //DEBUG_PRINTLN(isPumpOn());
-
-  {
-    unsigned long now = millis();
-    if ((long)(now - lastPublish) >= (long)publishIntervalMs) {
-      if (mqttConnected) {
-        RS485_loop();
-        if (publishMessage()) {
-          lastPublish = now;  // We advance to timer only if we have published
-        }
-      } else {
+  // ========== Periodic telemetry publishing ==========
+  if ((long)(now - lastPublish) >= (long)publishIntervalMs) {
+    if (mqttConnected) {
+      RS485_loop();
+      if (publishMessage()) {
         lastPublish = now;
-        DEBUG_PRINTLN(F("Skipping publication: MQTT not connected."));
       }
+    } else {
+      lastPublish = now;
+      DEBUG_PRINTLN(F("[PUB] Skipping: MQTT not connected"));
     }
+  }
+  
+  // ========== Print statistics every 60 seconds (optional) ==========
+  static unsigned long lastStatsLog = 0;
+  if (DEBUG && (now - lastStatsLog) >= 60000) {
+    lastStatsLog = now;
+    
+    const ATStats& stats = atManager->getStats();
+    DEBUG_PRINTLN(F("\n========== AT COMMAND STATS =========="));
+    DEBUG_PRINT(F("Commands: "));
+    DEBUG_PRINT(stats.commandsSent);
+    DEBUG_PRINT(F(" (OK:"));
+    DEBUG_PRINT(stats.commandsOK);
+    DEBUG_PRINT(F(", ERR:"));
+    DEBUG_PRINT(stats.commandsError);
+    DEBUG_PRINT(F(", TO:"));
+    DEBUG_PRINT(stats.commandsTimeout);
+    DEBUG_PRINTLN(F(")"));
+    DEBUG_PRINT(F("URCs: "));
+    DEBUG_PRINTLN(stats.urcsReceived);
+    DEBUG_PRINT(F("Pending: "));
+    DEBUG_PRINTLN(atManager->getPendingCommandCount());
+    DEBUG_PRINTLN(F("======================================\n"));
   }
 }
 
 
-// ----------------- HANDLERS -----------------
-void handleMQTTMessages() {
-  static char incoming[600];
-  static byte idx = 0;
+// ----------------- HELPER FUNCTIONS -----------------
 
-  auto secsFromHMS = [](int H, int M, int S) -> int {
-    if (H < 0) H = 0;
-    if (H > 23) H = 23;
-    if (M < 0) M = 0;
-    if (M > 59) M = 59;
-    if (S < 0) S = 0;
-    if (S > 59) S = 59;
-    return H * 3600 + M * 60 + S;
-  };
+// Helper: Convert HMS to seconds
+static inline int secsFromHMS(int H, int M, int S) {
+  if (H < 0) H = 0;
+  if (H > 23) H = 23;
+  if (M < 0) M = 0;
+  if (M > 59) M = 59;
+  if (S < 0) S = 0;
+  if (S > 59) S = 59;
+  return H * 3600 + M * 60 + S;
+}
 
-  auto circDiffSecs = [&](int a, int b) -> int {
-    const int DAY = 86400;
-    int d = abs(a - b);
-    if (d > DAY) d %= DAY;
-    return min(d, DAY - d);
-  };
+// Helper: Circular time difference
+static inline int circDiffSecs(int a, int b) {
+  const int DAY = 86400;
+  int d = abs(a - b);
+  if (d > DAY) d %= DAY;
+  return min(d, DAY - d);
+}
 
-  while (sim7070.available()) {
-    char c = sim7070.read();
-    noteUartActivity();
-    if (c == '\n' || c == '\r') {
-      incoming[idx] = '\0';
-      if (idx > 0) {
-        if (strncmp(incoming, "+SMSUB", 6) == 0) {
-          char* payload = strchr(incoming, ',');
-          if (payload) payload = strchr(payload + 1, '"');
-          if (payload) {
-            payload++;
-            char* end = strchr(payload, '"');
-            if (end) *end = '\0';
+// Helper: Process encrypted MQTT command
+void processMQTTCommand(const char* hexPayload) {
+  if (!hexPayload) return;
+  
+  DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+  DEBUG_PRINTLN(strlen(hexPayload));
+  DEBUG_PRINTLN(hexPayload);
 
-            DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
-            DEBUG_PRINTLN(strlen(payload));
-            DEBUG_PRINTLN(payload);
+  const char* hexStr = hexPayload;
+  size_t hexLen = strlen(hexStr);
+  
+  if ((hexLen % 2) != 0 || hexLen < (12 + 16) * 2) {
+    DEBUG_PRINTLN(F("[RX] Payload too short or invalid length"));
+    return;
+  }
+  
+  // Decode HEX to binary
+  uint8_t buf[480];
+  size_t bytes = 0;
+  if (!hexDecode(hexStr, buf, sizeof(buf), bytes) || bytes < (12 + 16)) {
+    DEBUG_PRINTLN(F("[RX] HEX decode failed"));
+    return;
+  }
 
-            const char* hexStr = payload;
-            size_t hexLen = strlen(hexStr);
-            if ((hexLen % 2) == 0 && hexLen >= (12 + 16) * 2) {
-              uint8_t buf[480];
-              size_t bytes = 0;
-              if (hexDecode(hexStr, buf, sizeof(buf), bytes) && bytes >= (12 + 16)) {
-                uint8_t* nonce = buf;
-                uint8_t* tag = buf + (bytes - 16);
-                uint8_t* ct = buf + 12;
-                size_t ctLen = bytes - 12 - 16;
+  // Extract nonce, tag, ciphertext
+  uint8_t* nonce = buf;
+  uint8_t* tag = buf + (bytes - 16);
+  uint8_t* ct = buf + 12;
+  size_t ctLen = bytes - 12 - 16;
 
-                int nH = nonce[4];
-                int nM = nonce[5];
-                int nS = nonce[6];
-                int secMsg = secsFromHMS(nH, nM, nS);
+  // Extract time from nonce
+  int nH = nonce[4];
+  int nM = nonce[5];
+  int nS = nonce[6];
+  int secMsg = secsFromHMS(nH, nM, nS);
 
-                // === Multiple tries to obtain ISO time ===
-                char isoNow[21] = { 0 };
-                int rH = 0, rM = 0, rS = 0;
-                bool timeOk = false;
+  // Get network time with retry
+  char isoNow[21] = {0};
+  int rH = 0, rM = 0, rS = 0;
+  bool timeOk = false;
 
-                for (uint8_t attempt = 1; attempt <= 5; attempt++) {
-                  DEBUG_PRINT(F("[TIME] Try number "));
-                  DEBUG_PRINT(attempt);
-                  DEBUG_PRINTLN(F(" from 3 to obtain ISO time..."));
+  for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+    DEBUG_PRINT(F("[TIME] Try "));
+    DEBUG_PRINT(attempt);
+    DEBUG_PRINTLN(F(" to get ISO time..."));
 
-                  memset(isoNow, 0, sizeof(isoNow));
-                  if (getNetworkTimeISO8601(isoNow, sizeof(isoNow))) {
-                    DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
-                    DEBUG_PRINTLN(isoNow);
+    memset(isoNow, 0, sizeof(isoNow));
+    if (getNetworkTimeISO8601(isoNow, sizeof(isoNow))) {
+      DEBUG_PRINT(F("[TIME] CCLK ISO: "));
+      DEBUG_PRINTLN(isoNow);
 
-                    if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
-                      DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
-                      DEBUG_PRINTLN(attempt);
-                      timeOk = true;
-                      break;
-                    } else {
-                      DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
-                    }
-                  } else {
-                    DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
-                  }
-
-                  delay(200 * attempt);
-                  WDT_RESET();
-                }
-
-                if (!timeOk) {
-                  DEBUG_PRINTLN(F("[TIME] Unable to obtain hour from network after 3 tries. Command discarded."));
-                  idx = 0;
-                  continue;
-                }
-
-                // === TIME OBTAINED WITH SUCCESS ===
-                const int secNow = secsFromHMS(rH, rM, rS);
-                const int dsec = circDiffSecs(secMsg, secNow);
-
-                DIAG_PRINT(F(" | NET HMS="));
-                DIAG_PRINT(isoNow + 11);
-                DIAG_PRINT(F(" | Δs="));
-                DIAG_PRINTLN(dsec);
-
-                // === DECIPHER → clear JSON ===
-                char plain[420];
-                bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
-                DEBUG_PRINT(F("[DECRYPT] Result: "));
-                DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
-                if (!ok) {
-                  idx = 0;
-                  continue;
-                }
-
-                DEBUG_PRINT(F("[RX] clear JSON: "));
-                DEBUG_PRINTLN(plain);
-
-                // Window of 30 s
-                const int WINDOW_SEC = 30;
-                if (dsec > WINDOW_SEC) {
-                  DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
-                  idx = 0;
-                  if (publishMessage()) lastPublish = millis();
-                  continue;
-                }
-
-                // === PROCESS X FIELD ===
-                long xVal = -1;
-                if (jsonGetInt(plain, "X", xVal)) {
-                  if (xVal == 1) {
-                    if (protectOnStart) {
-                      unsigned long elapsed = millis() - protectStartMs;
-                      DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protectio ("));
-                      DEBUG_PRINT(elapsed / 1000UL);
-                      DEBUG_PRINTLN(F(" s)."));
-                      if (publishMessage()) lastPublish = millis();
-                    } else {
-                      serverOnCommand = true;
-                      turnOnPump();
-                    }
-                  } else if (xVal == 0) {
-                    serverOnCommand = false;
-                    lastOffByHexFlag = true;
-                    turnOffPump();
-                    armStartProtection("Turned off by HEX command");
-                  } else {
-                    DEBUG_PRINT(F("[ACT] Invalid X Value: "));
-                    DEBUG_PRINTLN(xVal);
-                  }
-                } else {
-                  DEBUG_PRINTLN(F("[ACT] JSON without X field."));
-                }
-
-                long newPulse;
-                if (jsonGetInt(plain, "onPulse", newPulse)) {
-                  onPulse = constrain((int)newPulse, 500, 10000);
-                  DEBUG_PRINT(F("[ACT] onPulse updated to "));
-                  DEBUG_PRINTLN(onPulse);
-                }
-
-              } else {
-                DEBUG_PRINTLN(F("[RX] Invalid HEX HEX (deciphering o length)."));
-              }
-            } else {
-              DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
-            }
-          }
-        } else if (DIAG) {
-          DIAG_PRINT("[URC] ");
-          DIAG_PRINTLN(incoming);
-        }
+      if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
+        DEBUG_PRINT(F("[TIME] Parsed on attempt "));
+        DEBUG_PRINTLN(attempt);
+        timeOk = true;
+        break;
+      } else {
+        DEBUG_PRINTLN(F("[TIME] Parse failed"));
       }
-      idx = 0;
-    } else if (idx < sizeof(incoming) - 1) {
-      incoming[idx++] = c;
+    } else {
+      DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601 failed"));
     }
+
+    delay(200 * attempt);
+    WDT_RESET();
+  }
+
+  if (!timeOk) {
+    DEBUG_PRINTLN(F("[TIME] Failed to get time after 5 tries. Command discarded."));
+    return;
+  }
+
+  // Validate time window
+  const int secNow = secsFromHMS(rH, rM, rS);
+  const int dsec = circDiffSecs(secMsg, secNow);
+
+  DEBUG_PRINT(F("[TIME] NET UTC="));
+  DEBUG_PRINT(isoNow + 11);
+  DEBUG_PRINT(F(", Δs="));
+  DEBUG_PRINTLN(dsec);
+
+  const int WINDOW_SEC = 30;
+  if (dsec > WINDOW_SEC) {
+    DEBUG_PRINTLN(F("[TIME] Command outside 30s window. Rejected."));
+    if (publishMessage()) lastPublish = millis();
+    return;
+  }
+
+  // Decrypt payload
+  char plain[420];
+  bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
+  DEBUG_PRINT(F("[DECRYPT] Result: "));
+  DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
+  
+  if (!ok) {
+    DEBUG_PRINTLN(F("[DECRYPT] Failed"));
+    return;
+  }
+
+  DEBUG_PRINT(F("[RX] Decrypted JSON: "));
+  DEBUG_PRINTLN(plain);
+
+  // Process X field (pump control)
+  long xVal = -1;
+  if (jsonGetInt(plain, "X", xVal)) {
+    if (xVal == 1) {
+      if (protectOnStart) {
+        unsigned long elapsed = millis() - protectStartMs;
+        DEBUG_PRINT(F("[ACT] ON ignored (protection, "));
+        DEBUG_PRINT(elapsed / 1000UL);
+        DEBUG_PRINTLN(F(" s)"));
+        if (publishMessage()) lastPublish = millis();
+      } else {
+        serverOnCommand = true;
+        turnOnPump();
+      }
+    } else if (xVal == 0) {
+      serverOnCommand = false;
+      lastOffByHexFlag = true;
+      turnOffPump();
+      armStartProtection("Turned off by HEX command");
+    } else {
+      DEBUG_PRINT(F("[ACT] Invalid X value: "));
+      DEBUG_PRINTLN(xVal);
+    }
+  } else {
+    DEBUG_PRINTLN(F("[ACT] JSON without X field"));
+  }
+
+  // Process onPulse field
+  long newPulse;
+  if (jsonGetInt(plain, "onPulse", newPulse)) {
+    onPulse = constrain((int)newPulse, 500, 10000);
+    DEBUG_PRINT(F("[ACT] onPulse updated to "));
+    DEBUG_PRINTLN(onPulse);
+  }
+}
+
+// ----------------- URC HANDLERS (ATCommandLib) -----------------
+
+// URC Handler: MQTT message received
+void onMQTTMessageURC(const char* prefix, const char* data, void* userData) {
+  DEBUG_PRINTLN(F("\n========== MQTT MESSAGE URC =========="));
+  DEBUG_PRINT(F("[URC] "));
+  DEBUG_PRINTLN(data);
+  
+  // Parse +SMSUB: "topic",<length>,"<hex_payload>"
+  // Find the hex payload between the last pair of quotes
+  const char* payloadStart = data;
+  const char* lastQuote = nullptr;
+  
+  // Find last opening quote
+  while (*payloadStart) {
+    if (*payloadStart == '"') {
+      const char* nextQuote = strchr(payloadStart + 1, '"');
+      if (nextQuote) {
+        lastQuote = payloadStart;
+        payloadStart = nextQuote + 1;
+      } else {
+        break;
+      }
+    } else {
+      payloadStart++;
+    }
+  }
+  
+  if (lastQuote) {
+    lastQuote++; // Skip opening quote
+    const char* end = strchr(lastQuote, '"');
+    if (end) {
+      size_t len = end - lastQuote;
+      if (len > 0 && len < 600) {
+        char hexPayload[600];
+        strncpy(hexPayload, lastQuote, len);
+        hexPayload[len] = '\0';
+        
+        // Process the hex payload
+        processMQTTCommand(hexPayload);
+      }
+    }
+  }
+  
+  DEBUG_PRINTLN(F("======================================\n"));
+}
+
+// URC Handler: MQTT state changed
+void onMQTTStateURC(const char* prefix, const char* data, void* userData) {
+  DEBUG_PRINT(F("[URC] MQTT State: "));
+  DEBUG_PRINTLN(data);
+  
+  // +SMSTATE: 0 means disconnected
+  if (strstr(data, "0") != nullptr) {
+    DEBUG_PRINTLN(F("[URC] MQTT DISCONNECTED"));
+    mqttConnected = false;
+  } else if (strstr(data, "1") != nullptr) {
+    DEBUG_PRINTLN(F("[URC] MQTT CONNECTED"));
+    mqttConnected = true;
+  }
+}
+
+// URC Handler: PDP context changed (NETWORK/GPRS state, not MQTT)
+void onPDPContextURC(const char* prefix, const char* data, void* userData) {
+  DEBUG_PRINT(F("[URC] PDP Context (Network): "));
+  DEBUG_PRINTLN(data);
+  
+  // +APP PDP: 0,DEACTIVE means GPRS/Network context deactivated
+  if (strstr(data, "DEACTIVE") != nullptr) {
+    DEBUG_PRINTLN(F("[URC] NETWORK DEACTIVATED - GPRS lost!"));
+    
+    // When network is lost, MQTT is also lost
+    mqttConnected = false;
+    
+    // Reset GPRS fail streaks to trigger reconnection in checkConnections()
+    gprsFailStreak = GPRS_FAILS_BEFORE_RESTART;
+    
+    DEBUG_PRINTLN(F("[URC] Triggering GPRS reconnection..."));
+    
+  } else if (strstr(data, "ACTIVE") != nullptr) {
+    DEBUG_PRINTLN(F("[URC] NETWORK ACTIVATED - GPRS connected"));
+    
+    // Network is back, but MQTT needs to reconnect
+    // checkConnections() will handle MQTT reconnection
   }
 }
 
@@ -613,7 +758,6 @@ static inline void applyBootConfig() {
   //sendAT("ATE0", 150);
   sendAT("AT+CMEE=2", 120);
   sendAT("AT+CSOCKSETPN=1", 200);
-  sendAT("AT+SMCONF=\"CONTEXTID\",1", 200);
   sendAT("AT+CSCLK=0", 150);
 }
 
@@ -1222,26 +1366,40 @@ bool gprsIsConnected() {
 }
 
 // ----------------- AT HELPERS -----------------
+// REFACTORED: Now uses ATCommandLib
 void sendAT(const char* command, unsigned long wait) {
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
+  if (!atManager) {
+    DEBUG_PRINTLN(F("[ERROR] atManager not initialized!"));
+    return;
   }
-
-  sim7070.println(command);
-  noteUartActivity();
+  
+  // Use ATCommandLib sync command
+  // Convert wait time to timeout (wait was for delay, timeout is for response)
+  unsigned long timeout = wait + 1000; // Add buffer for response time
+  
   if (DIAG) {
     DIAG_PRINT(F("[DIAG] sendAT \""));
     DIAG_PRINT(command);
-    DIAG_PRINT(F("\" wait="));
-    DIAG_PRINTLN(wait);
+    DIAG_PRINT(F("\" timeout="));
+    DIAG_PRINTLN(timeout);
   }
-  delay(wait);
-  readResponse();
+  
+  // Send command and wait for OK
+  char response[256];
+  if (atManager->sendCommandSync(command, "OK", timeout, response, sizeof(response))) {
+    // Success - print response if debug enabled
+    if (DEBUG && response[0] != '\0') {
+      DEBUG_PRINT(F("[AT] Response: "));
+      DEBUG_PRINTLN(response);
+    }
+    noteUartActivity();
+  } else {
+    // Failed or timeout
+    if (DIAG) {
+      DIAG_PRINT(F("[DIAG] sendAT FAILED: "));
+      DIAG_PRINTLN(command);
+    }
+  }
 }
 
 bool syncTimeUTC_viaCNTP(uint8_t cid, const char* server, uint32_t waitTotalMs) {
@@ -1359,122 +1517,70 @@ bool syncTimeUTC_any(uint8_t cid, uint32_t waitTotalMs) {
 bool sendATwaitOK(const char* cmd, char* out, size_t outCap, unsigned long overallMs) {
   if (outCap == 0) return false;
   out[0] = '\0';
-
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
+  
+  if (!atManager) {
+    DEBUG_PRINTLN(F("[ERROR] atManager not initialized!"));
+    return false;
   }
 
   if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendATwaitOK avail-before="));
-    DIAG_PRINTLN(sim7070.available());
+    DIAG_PRINT(F("[DIAG] sendATwaitOK cmd="));
+    DIAG_PRINTLN(cmd);
   }
 
-  sim7070.println(cmd);
-  noteUartActivity();
-
-  unsigned long tstart = millis();
-  size_t w = 0;
-  bool sawOK = false, sawERROR = false;
-
-  while (millis() - tstart < overallMs) {
-    while (sim7070.available()) {
-      char c = sim7070.read();
-      noteUartActivity();
-      if (w < outCap - 1) out[w++] = c;
-
-      if (c == '\n') {
-        out[w] = '\0';
-        if (strstr(out, "\nOK") || strstr(out, "OK\r") || strstr(out, "OK\n")) {
-          sawOK = true;
-          goto done;
-        }
-        if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) {
-          sawERROR = true;
-          goto done;
-        }
-      }
+  bool success = atManager->sendCommandSync(cmd, "OK", overallMs, out, outCap);
+  
+  if (success) {
+    noteUartActivity();
+    lastATokMs = millis();
+    
+    if (DIAG) {
+      DIAG_PRINT(F("[DIAG] sendATwaitOK result=OK bytes="));
+      DIAG_PRINTLN(strlen(out));
     }
-    WDT_RESET();
+  } else {
+    if (DIAG) {
+      DIAG_PRINTLN(F("[DIAG] sendATwaitOK result=FAIL"));
+    }
   }
-
-  out[w] = '\0';
-  if (strstr(out, "OK")) sawOK = true;
-  if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) sawERROR = true;
-
-done:
-  out[w] = '\0';
-  if (sawOK && !sawERROR) lastATokMs = millis();
-  if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendATwaitOK result="));
-    DIAG_PRINT(sawOK && !sawERROR ? "OK" : "FAIL");
-    DIAG_PRINT(F(" bytes="));
-    DIAG_PRINTLN(w);
-  }
-  return sawOK && !sawERROR;
+  
+  return success;
 }
 
 void flushSIMBuffer() {
-  while (sim7070.available()) (void)sim7070.read();
+  if (DIAG) {
+    DIAG_PRINTLN(F("[DIAG] flushSIMBuffer called (now handled by ATCommandLib)"));
+  }
 }
-
 void sendCommandGetResponse(const char* command, char* buffer, size_t bufferSize, unsigned long timeout) {
   if (bufferSize == 0) return;
   buffer[0] = '\0';
-  /*
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
+  
+  if (!atManager) {
+    DEBUG_PRINTLN(F("[ERROR] atManager not initialized!"));
+    return;
   }
-*/
+  
   if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendCmd avail-before="));
-    DIAG_PRINT(sim7070.available());
-    DIAG_PRINT(F(" cmd="));
+    DIAG_PRINT(F("[DIAG] sendCmd cmd="));
     DIAG_PRINTLN(command);
   }
-
-  sim7070.println(command);
-  noteUartActivity();
-
-  unsigned long start = millis();
-  size_t idx = 0;
-  bool sawTerminator = false;
-
-  while (millis() - start < timeout && idx < bufferSize - 1) {
-    while (sim7070.available() && idx < bufferSize - 1) {
-      char c = sim7070.read();
-      noteUartActivity();
-      buffer[idx++] = c;
-
-      if (c == '\n') {
-        buffer[idx] = '\0';
-        if (strstr(buffer, "\nOK") || strstr(buffer, "OK\r") || strstr(buffer, "OK\n") || strstr(buffer, "ERROR") || strstr(buffer, "+CME ERROR")) {
-          sawTerminator = true;
-          goto endread;
-        }
-      }
+  
+  bool success = atManager->sendCommandSync(command, "OK", timeout, buffer, bufferSize);
+  
+  if (success) {
+    noteUartActivity();
+    lastATokMs = millis();
+    
+    if (DIAG) {
+      DIAG_PRINT(F("[DIAG] sendCmd SUCCESS bytes="));
+      DIAG_PRINTLN(strlen(buffer));
     }
-    WDT_RESET();
-  }
-
-endread:
-  buffer[idx] = '\0';
-  if (strstr(buffer, "OK")) lastATokMs = millis();
-
-  if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendCmd done bytes="));
-    DIAG_PRINT(idx);
-    DIAG_PRINT(F(" sawTerm="));
-    DIAG_PRINTLN(sawTerminator ? "Y" : "N");
+  } else {
+    if (DIAG) {
+      DIAG_PRINT(F("[DIAG] sendCmd FAILED: "));
+      DIAG_PRINTLN(command);
+    }
   }
 }
 
