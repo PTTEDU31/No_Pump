@@ -755,7 +755,7 @@ static inline void serviceStartProtection() {
 
 // MODEM CONFIGURATION
 static inline void applyBootConfig() {
-  //sendAT("ATE0", 150);
+  sendAT("ATE0", 150);
   sendAT("AT+CMEE=2", 120);
   sendAT("AT+CSOCKSETPN=1", 200);
   sendAT("AT+CSCLK=0", 150);
