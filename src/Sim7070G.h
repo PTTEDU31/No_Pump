@@ -39,6 +39,9 @@ enum class MQTTState {
 typedef void (*NetworkStateCallback)(Sim7070GState state);
 typedef void (*MQTTMessageCallback)(const char* topic, const uint8_t* payload, uint32_t len);
 typedef void (*MQTTStateCallback)(MQTTState state);
+
+/** CNTP result codes: 1=success, 61=Network Error, 62=DNS error, 63=Connection Error, 64=Service response error, 65=Service Response Timeout */
+typedef void (*CNTPResultCallback)(int resultCode);
 typedef void (*HTTPResponseCallback)(int statusCode, const char* response, size_t len, void* userData);
 typedef void (*SocketDataCallback)(int socketId, const uint8_t* data, size_t len, void* userData);
 
@@ -91,6 +94,14 @@ public:
   NetworkInfo getNetworkInfo();
   bool isNetworkConnected();
 
+  /**
+   * Fast CNACT: read AT+CGDCONT?, activate each IP context with AT+CNACT=<cid>,1.
+   * Active network is reported via URC (+CNACT / +APP PDP); no polling.
+   * @param waitActiveMs Unused (kept for API compatibility).
+   * @return true if CGDCONT? OK and at least one CNACT=1 was sent.
+   */
+  bool fastActivatePDPFromCGDCONT(uint32_t waitActiveMs = 15000);
+
   void setNetworkStateCallback(NetworkStateCallback callback) { _networkStateCallback = callback; }
 
   bool mqttBegin();
@@ -111,6 +122,7 @@ public:
 
   void setMQTTMessageCallback(MQTTMessageCallback callback) { _mqttMessageCallback = callback; }
   void setMQTTStateCallback(MQTTStateCallback callback) { _mqttStateCallback = callback; }
+  void setCNTPResultCallback(CNTPResultCallback callback) { _cntpResultCallback = callback; }
 
   bool httpBegin();
   bool httpSetSSL(uint8_t sslIndex = 0);
@@ -226,6 +238,7 @@ private:
   NetworkStateCallback _networkStateCallback;
   MQTTMessageCallback _mqttMessageCallback;
   MQTTStateCallback _mqttStateCallback;
+  CNTPResultCallback _cntpResultCallback;
 
   uint32_t _atCommandCount;
   uint32_t _atErrorCount;
@@ -246,6 +259,7 @@ private:
   static void onURC_CNACT(const char* urc, const char* data);
   static void onURC_APP_PDP(const char* urc, const char* data);
   static void onURC_SMCONN(const char* urc, const char* data);
+  static void onURC_CNTP(const char* urc, const char* data);
   static void onUnsolicitedResponse(ATResponseType type, const char* response, void* userData);
 
   static Sim7070G* _instance;

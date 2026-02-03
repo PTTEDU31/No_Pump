@@ -19,6 +19,7 @@ Sim7070G::Sim7070G(HardwareSerial *serial, uint8_t powerPin, uint32_t baudRate)
       _networkStateCallback(nullptr),
       _mqttMessageCallback(nullptr),
       _mqttStateCallback(nullptr),
+      _cntpResultCallback(nullptr),
       _atCommandCount(0),
       _atErrorCount(0),
       _waitingPublishResponse(false),
@@ -71,6 +72,7 @@ bool Sim7070G::begin()
   _at.registerURCHandler("+CNACT", onURC_CNACT);
   _at.registerURCHandler("+APP PDP", onURC_APP_PDP);
   _at.registerURCHandler("+SMCONN", onURC_SMCONN);
+  _at.registerURCHandler("+CNTP", onURC_CNTP);
   _at.setUnsolicitedResponseCallback(onUnsolicitedResponse, this);
 
   updateState(Sim7070GState::INITIALIZING);
@@ -358,8 +360,6 @@ Sim7070GState Sim7070G::getState()
 }
 bool Sim7070G::attacthService()
 {
-  char response[256];
-
   DEBUG_PRINTLN(F("[PDP] Step 1: Checking SIM card status..."));
   if (!checkSIM())
   {
@@ -539,6 +539,75 @@ bool Sim7070G::deactivatePDPContext(uint8_t cid)
   char cmd[32];
   snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,%d", cid, 0);
   return _at.sendCommandSync(cmd, 10000);
+}
+
+bool Sim7070G::fastActivatePDPFromCGDCONT(uint32_t /* waitActiveMs */)
+{
+  char response[512];
+  if (!_at.sendCommandSync("AT+CGDCONT?", 5000, response, sizeof(response)))
+  {
+    DEBUG_PRINTLN(F("[fastCNACT] AT+CGDCONT? failed"));
+    return false;
+  }
+
+  // Parse each line: +CGDCONT: <cid>,"<PDP_type>","<APN>","<IP>",...
+  // Prefer IP over IPV4V6, activate only one context
+  const char *line = response;
+  int bestCid = -1;
+  int bestPri = -1;  // 0=IP (preferred), 1=IPV4V6
+
+  while (line && *line)
+  {
+    const char *cgd = strstr(line, "+CGDCONT:");
+    if (!cgd)
+      break;
+
+    int cid = -1;
+    char pdpType[16] = {0};
+    char apn[64] = {0};
+    char ip[32] = {0};
+    if (sscanf(cgd, "+CGDCONT: %d,\"%15[^\"]\",\"%63[^\"]\",\"%31[^\"]\"", &cid, pdpType, apn, ip) >= 2)
+    {
+      if (cid >= 0)
+      {
+        int pri = (strcmp(pdpType, "IP") == 0) ? 0 : (strcmp(pdpType, "IPV4V6") == 0) ? 1 : -1;
+        if (pri >= 0 && (bestPri < 0 || pri < bestPri))
+        {
+          bestCid = cid;
+          bestPri = pri;
+        }
+      }
+    }
+
+    line = strchr(cgd, '\n');
+    if (line)
+      line++;
+    else
+      break;
+  }
+
+  if (bestCid < 0)
+  {
+    DEBUG_PRINTLN(F("[fastCNACT] no IP/IPV4V6 context found in CGDCONT"));
+    return false;
+  }
+
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,1", bestCid);
+  if (!_at.sendCommandSync(cmd, 5000))
+  {
+    DEBUG_PRINT(F("[fastCNACT] CNACT="));
+    DEBUG_PRINT(bestCid);
+    DEBUG_PRINTLN(F(",1 failed"));
+    return false;
+  }
+  DEBUG_PRINT(F("[fastCNACT] CNACT="));
+  DEBUG_PRINT(bestCid);
+  DEBUG_PRINTLN(F(",1 sent OK"));
+
+  // No polling: URC +CNACT / +APP PDP will update state via onURC_CNACT / onURC_APP_PDP
+  DEBUG_PRINTLN(F("[fastCNACT] commands sent; active network via URC"));
+  return true;
 }
 
 bool Sim7070G::getIPAddress(char *ip, size_t len)
@@ -721,7 +790,7 @@ bool Sim7070G::mqttConnect()
   // Check connection state - state 1 means connected
   if (checkSendCommandSync("AT+SMSTATE?", "+SMSTATE: 1", 5000))
   {
-    updateMQTTState(MQTTState::CONNECTED);
+    // updateMQTTState(MQTTState::CONNECTED);
     return true;
   }
 
@@ -737,8 +806,6 @@ bool Sim7070G::mqttDisconnect()
   {
     return false;
   }
-
-  updateMQTTState(MQTTState::DISCONNECTED);
   return true;
 }
 
@@ -1093,7 +1160,8 @@ bool Sim7070G::httpReadResponse(char *buffer, size_t bufferSize, size_t *bytesRe
     if (dataStart)
     {
       dataStart++; // Skip comma
-      size_t copyLen = (length < (bufferSize - 1)) ? length : (bufferSize - 1);
+      size_t len = (length > 0) ? (size_t)length : 0;
+      size_t copyLen = (len < bufferSize - 1) ? len : bufferSize - 1;
       strncpy(buffer, dataStart, copyLen);
       buffer[copyLen] = '\0';
       if (bytesRead)
@@ -1203,7 +1271,8 @@ bool Sim7070G::socketReceive(int socketId, uint8_t *buffer, size_t bufferSize, s
       if (dataStart)
       {
         dataStart++; // Skip comma
-        size_t copyLen = (length < bufferSize) ? length : bufferSize;
+        size_t len = (length > 0) ? (size_t)length : 0;
+        size_t copyLen = (len < bufferSize) ? len : bufferSize;
         memcpy(buffer, dataStart, copyLen);
         if (bytesRead)
         {
@@ -1493,11 +1562,18 @@ void Sim7070G::onURC_APP_PDP(const char *urc, const char *data)
 
 void Sim7070G::onURC_SMCONN(const char *urc, const char *data)
 {
-  DEBUG_PRINTLN(F("[URC] SMCONN: "));
-  DEBUG_PRINTLN(data);
-  if (strcmp(data, "1") == 0)
+  if (!_instance || !data)
+    return;
+  int result = -1;
+  if (sscanf(data, "%d", &result) != 1)
   {
-    DEBUG_PRINTLN(F("[URC] SMCONN: OK"));
+    DEBUG_PRINTLN(F("[URC] SMCONN: parse failed"));
+    _instance->updateMQTTState(MQTTState::DISCONNECTED);
+    return;
+  }
+  if (result == 1)
+  {
+    DEBUG_PRINTLN(F("[URC] SMCONN: OK (1)"));
     _instance->updateMQTTState(MQTTState::CONNECTED);
   }
   else
@@ -1507,6 +1583,42 @@ void Sim7070G::onURC_SMCONN(const char *urc, const char *data)
   }
 }
 
+void Sim7070G::onURC_CNTP(const char *urc, const char *data)
+{
+  if (!_instance || !data)
+    return;
+  int resultCode = -1;
+  if (sscanf(data, "%d", &resultCode) != 1)
+    return;
+  // 1 = UTC time sync successful, 61 = Network Error, 62 = DNS error, 63 = Connection Error, 64 = Service response error, 65 = Service Response Timeout
+  switch (resultCode)
+  {
+  case 1:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 1 UTC time synchronization is successful"));
+    break;
+  case 61:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 61 Network Error"));
+    break;
+  case 62:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 62 DNS resolution error"));
+    break;
+  case 63:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 63 Connection Error"));
+    break;
+  case 64:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 64 Service response error"));
+    break;
+  case 65:
+    DEBUG_PRINTLN(F("[URC] +CNTP: 65 Service Response Timeout"));
+    break;
+  default:
+    DEBUG_PRINT(F("[URC] +CNTP: "));
+    DEBUG_PRINTLN(resultCode);
+    break;
+  }
+  if (_instance->_cntpResultCallback)
+    _instance->_cntpResultCallback(resultCode);
+}
 
 // Command wrappers - expose Sim7070G_AT methods
 bool Sim7070G::sendCommandSync(const char *command, unsigned long timeout,
@@ -1544,9 +1656,9 @@ bool Sim7070G::checkSendCommandSync(const char *command, const char *expectedRes
   char *responsePtr = response;
   DEBUG_PRINTLN(F("[CMD] Response: "));
   DEBUG_PRINTLN(response);
-  for (int i = 0; i < strlen(response); i++) {
-    printf("%02X ", responsePtr[i]);
-}
+  for (size_t i = 0; i < strlen(response); i++) {
+    printf("%02X ", (unsigned char)responsePtr[i]);
+  }
   if (strncmp(responsePtr, command, strlen(command)) == 0)
   {
     // Skip echo line

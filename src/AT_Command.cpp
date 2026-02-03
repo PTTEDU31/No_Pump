@@ -242,7 +242,18 @@ void Sim7070G_AT::processResponse() {
       }
     } else {
       if (_responsePos < (sizeof(_responseBuffer) - 1)) {
-        _responseBuffer[_responsePos++] = byte;
+        if (_currentCommand && _currentCommand->waiting && _responseBuffer[0] == '>' &&
+            (_responsePos == 1 || (_responsePos == 2 && _responseBuffer[1] == ' '))) {
+          _responseBuffer[_responsePos] = '\0';
+          if (parseResponse(_responseBuffer) == ATResponseType::OK) {
+            completeCommand(ATResponseType::OK, _responseBuffer);
+          }
+          _responsePos = 0;
+          memset(_responseBuffer, 0, sizeof(_responseBuffer));
+        }
+        if (_responsePos < (sizeof(_responseBuffer) - 1)) {
+          _responseBuffer[_responsePos++] = byte;
+        }
       }
     }
   }

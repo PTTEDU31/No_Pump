@@ -8,6 +8,7 @@
 #include "wiring_private.h"
 #include "config.h"
 #include "crypto_json_utils.h"
+#include "Sim7070G.h"
 
 // Node credentials from config.h
 const char* NODE_ID = CONFIG_NODE_ID;
@@ -158,7 +159,9 @@ struct modbus_transmit {
 
 } MODBUS_REQ;
 
-
+static Sim7070G modem(&sim7070, MODEM_PWR_PIN, MODEM_BAUD_RATE);
+static void mainMQTTMessageCallback(const char* topic, const uint8_t* payload, uint32_t len);
+static void mainCNTPResultCallback(int resultCode);
 
 // ----------------- PROTOTYPES -----------------
 void sendAT(const char* command, unsigned long wait = 100);  // Sends command AT to the modem
@@ -169,6 +172,7 @@ void readResponse();
 void modemRestart();
 void mqttConnect();
 bool checkMQTTConnection();
+static void mainMQTTStateCallback(MQTTState state);
 bool publishMessage();
 bool gprsConnect();
 bool gprsIsConnected();
@@ -190,17 +194,12 @@ static inline void applyBootConfig();
 void diagSnapshot(const char* label);
 static inline void servicePumpEdgeAndStatus();
 
-// NEW: ENSURE AT (MODEM ON) BEFORE CFUN/CNACT WHEN CNACT? RETURNS 0 bytes
 static bool ensureATorPowerCycle(uint8_t atAttempts = 3);
 
 // PROTECTION HELPERS
 static inline bool isPumpOn();
 static inline void armStartProtection(const char* motivo);
 static inline void serviceStartProtection();
-
-bool syncTimeUTC_viaCNTP(uint8_t timeZone, const char* server, uint32_t waitTotalMs);
-bool syncTimeUTC_any(uint8_t timeZone, uint32_t waitTotalMs);
-
 
 int getCSQ_RSSI();       // returns 0..31; -1 if unknown
 int csqToDbm(int rssi);  // useful optional: converts CSQ to dBm
@@ -250,7 +249,13 @@ void setup() {
   delay(100);
 
 
-  sim7070.begin(115200);
+  sim7070.begin(MODEM_BAUD_RATE);
+  if (!modem.begin()) {
+    DEBUG_PRINTLN(F("modem.begin() failed"));
+  }
+  modem.setMQTTMessageCallback(mainMQTTMessageCallback);
+  modem.setMQTTStateCallback(mainMQTTStateCallback);
+  modem.setCNTPResultCallback(mainCNTPResultCallback);
 
   tempSAMD.init();
   analogReadResolution(12);
@@ -294,8 +299,8 @@ void setup() {
 
 // ----------------- LOOP -----------------
 void loop() {
-
   WDT_RESET();
+  modem.loop();
   serviceStartProtection();
 
   handleMQTTMessages();
@@ -325,179 +330,136 @@ void loop() {
 
 
 // ----------------- HANDLERS -----------------
-void handleMQTTMessages() {
-  static char incoming[600];
-  static byte idx = 0;
+static int secsFromHMS(int H, int M, int S) {
+  if (H < 0) H = 0;
+  if (H > 23) H = 23;
+  if (M < 0) M = 0;
+  if (M > 59) M = 59;
+  if (S < 0) S = 0;
+  if (S > 59) S = 59;
+  return H * 3600 + M * 60 + S;
+}
+static int circDiffSecs(int a, int b) {
+  const int DAY = 86400;
+  int d = abs(a - b);
+  if (d > DAY) d %= DAY;
+  return min(d, DAY - d);
+}
 
-  auto secsFromHMS = [](int H, int M, int S) -> int {
-    if (H < 0) H = 0;
-    if (H > 23) H = 23;
-    if (M < 0) M = 0;
-    if (M > 59) M = 59;
-    if (S < 0) S = 0;
-    if (S > 59) S = 59;
-    return H * 3600 + M * 60 + S;
-  };
-
-  auto circDiffSecs = [&](int a, int b) -> int {
-    const int DAY = 86400;
-    int d = abs(a - b);
-    if (d > DAY) d %= DAY;
-    return min(d, DAY - d);
-  };
-
-  while (sim7070.available()) {
-    char c = sim7070.read();
-    noteUartActivity();
-    if (c == '\n' || c == '\r') {
-      incoming[idx] = '\0';
-      if (idx > 0) {
-        if (strncmp(incoming, "+SMSUB", 6) == 0) {
-          char* payload = strchr(incoming, ',');
-          if (payload) payload = strchr(payload + 1, '"');
-          if (payload) {
-            payload++;
-            char* end = strchr(payload, '"');
-            if (end) *end = '\0';
-
-            DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
-            DEBUG_PRINTLN(strlen(payload));
-            DEBUG_PRINTLN(payload);
-
-            const char* hexStr = payload;
-            size_t hexLen = strlen(hexStr);
-            if ((hexLen % 2) == 0 && hexLen >= (12 + 16) * 2) {
-              uint8_t buf[480];
-              size_t bytes = 0;
-              if (hexDecode(hexStr, buf, sizeof(buf), bytes) && bytes >= (12 + 16)) {
-                uint8_t* nonce = buf;
-                uint8_t* tag = buf + (bytes - 16);
-                uint8_t* ct = buf + 12;
-                size_t ctLen = bytes - 12 - 16;
-
-                int nH = nonce[4];
-                int nM = nonce[5];
-                int nS = nonce[6];
-                int secMsg = secsFromHMS(nH, nM, nS);
-
-                // === Multiple tries to obtain ISO time ===
-                char isoNow[21] = { 0 };
-                int rH = 0, rM = 0, rS = 0;
-                bool timeOk = false;
-
-                for (uint8_t attempt = 1; attempt <= 5; attempt++) {
-                  DEBUG_PRINT(F("[TIME] Try number "));
-                  DEBUG_PRINT(attempt);
-                  DEBUG_PRINTLN(F(" from 3 to obtain ISO time..."));
-
-                  memset(isoNow, 0, sizeof(isoNow));
-                  if (getNetworkTimeISO8601(isoNow, sizeof(isoNow))) {
-                    DEBUG_PRINT(F("[TIME] Response CCLK ISO: "));
-                    DEBUG_PRINTLN(isoNow);
-
-                    if (sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
-                      DEBUG_PRINT(F("[TIME] Successful parsing of time on try number: "));
-                      DEBUG_PRINTLN(attempt);
-                      timeOk = true;
-                      break;
-                    } else {
-                      DEBUG_PRINTLN(F("[TIME] Failure to parse format HH:MM:SS."));
-                    }
-                  } else {
-                    DEBUG_PRINTLN(F("[TIME] getNetworkTimeISO8601() failed (without response)."));
-                  }
-
-                  delay(200 * attempt);
-                  WDT_RESET();
-                }
-
-                if (!timeOk) {
-                  DEBUG_PRINTLN(F("[TIME] Unable to obtain hour from network after 3 tries. Command discarded."));
-                  idx = 0;
-                  continue;
-                }
-
-                // === TIME OBTAINED WITH SUCCESS ===
-                const int secNow = secsFromHMS(rH, rM, rS);
-                const int dsec = circDiffSecs(secMsg, secNow);
-
-                DIAG_PRINT(F(" | NET HMS="));
-                DIAG_PRINT(isoNow + 11);
-                DIAG_PRINT(F(" | Δs="));
-                DIAG_PRINTLN(dsec);
-
-                // === DECIPHER → clear JSON ===
-                char plain[420];
-                bool ok = decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain));
-                DEBUG_PRINT(F("[DECRYPT] Result: "));
-                DEBUG_PRINTLN(ok ? F("OK") : F("FAIL"));
-                if (!ok) {
-                  idx = 0;
-                  continue;
-                }
-
-                DEBUG_PRINT(F("[RX] clear JSON: "));
-                DEBUG_PRINTLN(plain);
-
-                // Window of 30 s
-                const int WINDOW_SEC = 30;
-                if (dsec > WINDOW_SEC) {
-                  DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
-                  idx = 0;
-                  if (publishMessage()) lastPublish = millis();
-                  continue;
-                }
-
-                // === PROCESS X FIELD ===
-                long xVal = -1;
-                if (jsonGetInt(plain, "X", xVal)) {
-                  if (xVal == 1) {
-                    if (protectOnStart) {
-                      unsigned long elapsed = millis() - protectStartMs;
-                      DEBUG_PRINT(F("[ACT] ON command arrived, ignored for protectio ("));
-                      DEBUG_PRINT(elapsed / 1000UL);
-                      DEBUG_PRINTLN(F(" s)."));
-                      if (publishMessage()) lastPublish = millis();
-                    } else {
-                      serverOnCommand = true;
-                      turnOnPump();
-                    }
-                  } else if (xVal == 0) {
-                    serverOnCommand = false;
-                    lastOffByHexFlag = true;
-                    turnOffPump();
-                    armStartProtection("Turned off by HEX command");
-                  } else {
-                    DEBUG_PRINT(F("[ACT] Invalid X Value: "));
-                    DEBUG_PRINTLN(xVal);
-                  }
-                } else {
-                  DEBUG_PRINTLN(F("[ACT] JSON without X field."));
-                }
-
-                long newPulse;
-                if (jsonGetInt(plain, "onPulse", newPulse)) {
-                  onPulse = constrain((int)newPulse, 500, 10000);
-                  DEBUG_PRINT(F("[ACT] onPulse updated to "));
-                  DEBUG_PRINTLN(onPulse);
-                }
-
-              } else {
-                DEBUG_PRINTLN(F("[RX] Invalid HEX HEX (deciphering o length)."));
-              }
-            } else {
-              DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
-            }
-          }
-        } else if (DIAG) {
-          DIAG_PRINT("[URC] ");
-          DIAG_PRINTLN(incoming);
-        }
-      }
-      idx = 0;
-    } else if (idx < sizeof(incoming) - 1) {
-      incoming[idx++] = c;
+static void mainMQTTStateCallback(MQTTState state) {
+  if (state == MQTTState::CONNECTED) {
+    if (modem.mqttSubscribe(topic_sub, 0)) {
+      DEBUG_PRINT(F("[MQTT] Subscribed to: "));
+      DEBUG_PRINTLN(topic_sub);
     }
+  }
+}
+
+static void mainMQTTMessageCallback(const char* topic, const uint8_t* payload, uint32_t len) {
+  char hexStr[600];
+  if (len == 0 || len >= sizeof(hexStr)) return;
+  memcpy(hexStr, payload, len);
+  hexStr[len] = '\0';
+
+  DEBUG_PRINT(F("[RX] HEX payload (raw), len="));
+  DEBUG_PRINTLN((int)len);
+  DEBUG_PRINTLN(hexStr);
+
+  size_t hexLen = strlen(hexStr);
+  if ((hexLen % 2) != 0 || hexLen < (12 + 16) * 2) {
+    DEBUG_PRINTLN(F("[RX] Payload does not appear to be a valid HEX value or is too short."));
+    return;
+  }
+  uint8_t buf[480];
+  size_t bytes = 0;
+  if (!hexDecode(hexStr, buf, sizeof(buf), bytes) || bytes < (12 + 16)) {
+    DEBUG_PRINTLN(F("[RX] Invalid HEX (deciphering or length)."));
+    return;
+  }
+  uint8_t* nonce = buf;
+  uint8_t* tag = buf + (bytes - 16);
+  uint8_t* ct = buf + 12;
+  size_t ctLen = bytes - 12 - 16;
+
+  int nH = nonce[4], nM = nonce[5], nS = nonce[6];
+  int secMsg = secsFromHMS(nH, nM, nS);
+
+  char isoNow[21] = { 0 };
+  int rH = 0, rM = 0, rS = 0;
+  bool timeOk = false;
+  for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+    DEBUG_PRINT(F("[TIME] Try ")); DEBUG_PRINT(attempt); DEBUG_PRINTLN(F(" to obtain ISO time..."));
+    memset(isoNow, 0, sizeof(isoNow));
+    if (getNetworkTimeISO8601(isoNow, sizeof(isoNow)) && sscanf(isoNow + 11, "%2d:%2d:%2d", &rH, &rM, &rS) == 3) {
+      timeOk = true;
+      break;
+    }
+    delay(200 * attempt);
+    WDT_RESET();
+  }
+  if (!timeOk) {
+    DEBUG_PRINTLN(F("[TIME] Unable to obtain time. Command discarded."));
+    return;
+  }
+  const int secNow = secsFromHMS(rH, rM, rS);
+  const int dsec = circDiffSecs(secMsg, secNow);
+  DIAG_PRINT(F(" | NET HMS=")); DIAG_PRINT(isoNow + 11); DIAG_PRINT(F(" | Δs=")); DIAG_PRINTLN(dsec);
+
+  char plain[420];
+  if (!decryptPayload(ct, ctLen, tag, nonce, plain, sizeof(plain))) {
+    DEBUG_PRINTLN(F("[DECRYPT] FAIL"));
+    return;
+  }
+  DEBUG_PRINT(F("[RX] clear JSON: ")); DEBUG_PRINTLN(plain);
+
+  const int WINDOW_SEC = 30;
+  if (dsec > WINDOW_SEC) {
+    DEBUG_PRINTLN(F("[TIME] Command outside of time window (>30 s). Ignored."));
+    if (publishMessage()) lastPublish = millis();
+    return;
+  }
+
+  long xVal = -1;
+  if (jsonGetInt(plain, "X", xVal)) {
+    if (xVal == 1) {
+      if (protectOnStart) {
+        DEBUG_PRINT(F("[ACT] ON command ignored (protection "));
+        DEBUG_PRINT((millis() - protectStartMs) / 1000UL);
+        DEBUG_PRINTLN(F(" s)."));
+        if (publishMessage()) lastPublish = millis();
+      } else {
+        serverOnCommand = true;
+        turnOnPump();
+      }
+    } else if (xVal == 0) {
+      serverOnCommand = false;
+      lastOffByHexFlag = true;
+      turnOffPump();
+      armStartProtection("Turned off by HEX command");
+    } else {
+      DEBUG_PRINT(F("[ACT] Invalid X: ")); DEBUG_PRINTLN(xVal);
+    }
+  } else {
+    DEBUG_PRINTLN(F("[ACT] JSON without X field."));
+  }
+  long newPulse;
+  if (jsonGetInt(plain, "onPulse", newPulse)) {
+    onPulse = constrain((int)newPulse, 500, 10000);
+    DEBUG_PRINT(F("[ACT] onPulse=")); DEBUG_PRINTLN(onPulse);
+  }
+}
+
+void handleMQTTMessages() {
+  // Incoming MQTT (+SMSUB) are handled by modem.loop() -> mainMQTTMessageCallback
+}
+
+static void mainCNTPResultCallback(int resultCode) {
+  // 1 = success, 61 = Network Error, 62 = DNS error, 63 = Connection Error, 64 = Service response error, 65 = Service Response Timeout
+  if (resultCode == 1) {
+    DEBUG_PRINTLN(F("[NTP] URC: UTC time synchronization successful"));
+  } else {
+    DEBUG_PRINT(F("[NTP] URC: result="));
+    DEBUG_PRINTLN(resultCode);
   }
 }
 
@@ -901,14 +863,23 @@ bool publishMessage() {
   DEBUG_PRINTLN("Published HEX: ");
   DEBUG_PRINTLN(hexPayload);
 
-  int len = strlen(hexPayload);
-  sim7070.print(F("AT+SMPUB=\""));
-  sim7070.print(topic_pub);
-  sim7070.print(F("\","));
-  sim7070.print(len);
-  sim7070.println(F(",1,0"));
+  int len = (int)strlen(hexPayload);
+  char cmd[256];
+  char resp[64] = { 0 };
+  snprintf(cmd, sizeof(cmd), "AT+SMPUB=\"%s\",%d,1,0", topic_pub, len);
+  if (!modem.sendCommandSync(cmd, 5000, resp, sizeof(resp)) || strstr(resp, ">") == nullptr) {
+    DEBUG_PRINTLN(F("[SMPUB] no prompt >"));
+    DEBUG_PRINT(F("[SMPUB] response (hex): "));
+    for (size_t i = 0; i < strlen(resp); i++) {
+      uint8_t b = (uint8_t)resp[i];
+      if (b < 0x10) DEBUG_PRINT('0');
+      DEBUG_PRINT_F((int)b, HEX);
+      DEBUG_PRINT(' ');
+    }
+    DEBUG_PRINTLN();
+    return false;
+  }
   noteUartActivity();
-  delay(120);
   sim7070.print(hexPayload);
   noteUartActivity();
   delay(350);
@@ -920,16 +891,12 @@ bool publishMessage() {
 
 
 bool checkMQTTConnection() {
-  char response[96] = { 0 };
-  sendCommandGetResponse("AT+SMSTATE?", response, sizeof(response), 1500);
-  mqttConnected = strstr(response, "+SMSTATE: 1") != NULL;
-
+  mqttConnected = modem.isMQTTConnected();
   if (mqttConnected) {
     DEBUG_PRINTLN(F("Connected to MQTT"));
     lastMQTTokMs = millis();
   } else {
-    DEBUG_PRINT(F("MQTT NOT connected. State: "));
-    DEBUG_PRINTLN(response);
+    DEBUG_PRINTLN(F("MQTT NOT connected."));
   }
   return mqttConnected;
 }
@@ -941,56 +908,25 @@ void mqttConnect() {
     mqttConnected = false;
     return;
   }
-  if (checkMQTTConnection()) {
-    return;
+
+  if(modem.isMQTTConnected()) {
+    modem.mqttDisconnect();
   }
 
-  if (!ensureATorPowerCycle(3)) {
-    DEBUG_PRINTLN(F("mqttConnect: there are no AT after retry. Aborting."));
+  if (!modem.mqttSetConfig(clientID, mqtt_server, (uint16_t)mqtt_port,
+                           mqtt_username, mqtt_password,
+                           60, topic_pub, "", 0, true, false, true, true)) {
+    DEBUG_PRINTLN(F("mqttSetConfig failed"));
     mqttConnected = false;
     return;
   }
-  if (checkMQTTConnection()) {
-    DEBUG_PRINTLN(F("MQTT already connected after ensuring AT. Ommitting reconnection."));
-    return;
-  }
-
-  DEBUG_PRINTLN(F("Connecting to MQTT"));
-
-  sendAT("AT+SMDISC", 200);
-
-  char cmd[96];
-  sendAT("AT+SMCONF=\"URL\",\"\"", 100);
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"URL\",\"%s\"", mqtt_server);
-  sendAT(cmd, 120);
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PORT\",\"%d\"", mqtt_port);
-  sendAT(cmd, 120);
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"CLIENTID\",\"%s\"", clientID);
-  sendAT(cmd, 120);
-
-  sendAT("AT+SMCONF=\"CLEANSS\",1", 100);
-  sendAT("AT+SMCONF=\"QOS\",\"0\"", 100);
-  sendAT("AT+SMCONF=\"RETAIN\",\"0\"", 100);
-  sendAT("AT+SMCONF=\"KEEPTIME\",60", 100);
-
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"USERNAME\",\"%s\"", mqtt_username);
-  sendAT(cmd, 120);
-  snprintf(cmd, sizeof(cmd), "AT+SMCONF=\"PASSWORD\",\"%s\"", mqtt_password);
-  sendAT(cmd, 120);
-
   DEBUG_PRINTLN(F("Connecting to broker..."));
-  sendAT("AT+SMCONN", 2500);
-  delay(800);
-
-  if (checkMQTTConnection()) {
+  if (modem.mqttConnect()) {
     cntMqttConnects++;
-    snprintf(cmd, sizeof(cmd), "AT+SMSUB=\"%s\",1", topic_sub);
-    sendAT(cmd, 500);
-    DEBUG_PRINT(F("Subscribed to: "));
-    DEBUG_PRINTLN(topic_sub);
-    readResponse();
+    mqttConnected = true;
     lastMQTTokMs = millis();
   } else {
+    mqttConnected = false;
     DEBUG_PRINTLN(F("MQTT connection failed"));
   }
 }
@@ -1070,11 +1006,25 @@ bool gprsConnect() {
     DEBUG_PRINTLN(F("Connecting to data context (CID=1)."));
     lastGPRSokMs = millis();
     cntGprsConnects++;
-
-
-    syncTimeUTC_any(0, 12000UL);
-
+    modem.syncTimeUTC_any(0, 12000UL);
     return true;
+  }
+
+  // Fast path: read CGDCONT?, activate each IP context (CNACT=<cid>,1), URC will set state
+  DEBUG_PRINTLN(F("[GPRS] Trying fastActivatePDPFromCGDCONT..."));
+  if (modem.fastActivatePDPFromCGDCONT(15000)) {
+    for (int i = 0; i < 25; i++) {
+      modem.loop();
+      delay(400);
+      WDT_RESET();
+      if (gprsIsConnected()) {
+        DEBUG_PRINTLN(F("[GPRS] Connected via fast CNACT (URC)."));
+        lastGPRSokMs = millis();
+        cntGprsConnects++;
+        modem.syncTimeUTC_any(0, 12000UL);
+        return true;
+      }
+    }
   }
 
   {
@@ -1102,8 +1052,7 @@ bool gprsConnect() {
 
   sendAT("AT+CPSMS=0", 200);
   sendAT("AT+CGDCONT=1,\"IP\",\"" PDP_APN "\"", simWait);
-  sendAT("AT+CNMP=2", simWait);    // auto
-  sendAT("AT+CSOCKSETPN=1", 200);  // reinforcement
+  sendAT("AT+CNMP=2", simWait);
 
   for (uint8_t attempt = 0; attempt < 2; attempt++) {
     DEBUG_PRINT(F("Activating data context (try number: "));
@@ -1141,7 +1090,7 @@ bool gprsConnect() {
       lastGPRSokMs = millis();
       cntGprsConnects++;
 
-      syncTimeUTC_any(0, 12000UL);
+      modem.syncTimeUTC_any(0, 12000UL);
 
       return true;
     }
@@ -1162,219 +1111,34 @@ bool gprsIsConnected() {
   return ok;
 }
 
-// ----------------- AT HELPERS -----------------
+// ----------------- AT HELPERS (via Sim7070G library) -----------------
 void sendAT(const char* command, unsigned long wait) {
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
-  }
-
-  sim7070.println(command);
-  noteUartActivity();
   if (DIAG) {
     DIAG_PRINT(F("[DIAG] sendAT \""));
     DIAG_PRINT(command);
-    DIAG_PRINT(F("\" wait="));
+    DIAG_PRINT(F("\" timeout="));
     DIAG_PRINTLN(wait);
   }
-  delay(wait);
-  readResponse();
+  (void)modem.sendCommandSync(command, wait, nullptr, 0);
+  noteUartActivity();
 }
-
-bool syncTimeUTC_viaCNTP(uint8_t timeZone, const char* server, uint32_t waitTotalMs) {
-  char buf[128] = { 0 };
-  char cmd[96];
-  char timeBefore[160] = { 0 };
-  char timeAfter[160] = { 0 };
-
-  DEBUG_PRINT(F("[NTP] Synchronizing with server: "));
-  DEBUG_PRINTLN(server);
-
-  sendCommandGetResponse("AT+CCLK?", timeBefore, sizeof(timeBefore), 5000);
-
-  snprintf(cmd, sizeof(cmd), "AT+CNTP=\"%s\",%d", server, (int)timeZone);
-  sendCommandGetResponse(cmd, buf, sizeof(buf), 5000);
-  if (strstr(buf, "OK") == nullptr) {
-    DEBUG_PRINTLN(F("[NTP] Failed to configure NTP server"));
-    return false;
-  }
-
-  sendCommandGetResponse("AT+CNTP", buf, sizeof(buf), 5000);
-  if (strstr(buf, "OK") == nullptr) {
-    DEBUG_PRINTLN(F("[NTP] Failed to trigger NTP sync"));
-    return false;
-  }
-
-  bool ok = false;
-  bool explicitFailure = false;
-  unsigned long t0 = millis();
-
-  while (millis() - t0 < waitTotalMs) {
-    memset(buf, 0, sizeof(buf));
-    sendCommandGetResponse("AT+CNTP?", buf, sizeof(buf), 900);
-    if (strstr(buf, "OK") == nullptr) {
-      delay(600);
-      WDT_RESET();
-      continue;
-    }
-
-    const char* cntpPtr = strstr(buf, "+CNTP:");
-    if (cntpPtr) {
-      cntpPtr += 6;
-      while (*cntpPtr == ' ' || *cntpPtr == '\t') cntpPtr++;
-
-      int simpleStatus = -1;
-      if (sscanf(cntpPtr, "%d", &simpleStatus) == 1) {
-        if (simpleStatus == 1) {
-          ok = true;
-          DEBUG_PRINTLN(F("[NTP] Sync successful! (simple format)"));
-          break;
-        }
-        if (simpleStatus == 0) {
-          explicitFailure = true;
-          DEBUG_PRINTLN(F("[NTP] Explicit failure (+CNTP: 0)"));
-          break;
-        }
-      } else {
-        char serverName[64];
-        int tz = -1, offset = 0, mode = -1;
-        if (sscanf(cntpPtr, "\"%63[^\"]\",%d,%d,%d", serverName, &tz, &offset, &mode) == 4 ||
-            sscanf(cntpPtr, "%63[^,],%d,%d,%d", serverName, &tz, &offset, &mode) == 4) {
-          if (mode == 2) {
-            ok = true;
-            DEBUG_PRINTLN(F("[NTP] Sync successful! (mode=2)"));
-            break;
-          }
-          if (mode != 0) {
-            explicitFailure = true;
-            DEBUG_PRINT(F("[NTP] Error mode: "));
-            DEBUG_PRINTLN(mode);
-            break;
-          }
-        }
-      }
-    }
-
-    if (strstr(buf, "ERROR") || strstr(buf, "+CME ERROR")) {
-      explicitFailure = true;
-      DEBUG_PRINTLN(F("[NTP] Error response"));
-      break;
-    }
-
-    delay(600);
-    WDT_RESET();
-  }
-
-  if (!ok && !explicitFailure) {
-    DEBUG_PRINTLN(F("[NTP] Timeout waiting for response"));
-  }
-
-  sendCommandGetResponse("AT+CCLK?", timeAfter, sizeof(timeAfter), 1200);
-  if (ok && strcmp(timeBefore, timeAfter) == 0) {
-    DEBUG_PRINTLN(F("[NTP] Warning: Time didn't change after NTP sync"));
-  }
-
-  DEBUG_PRINT(F("[NTP] Time before: "));
-  DEBUG_PRINTLN(timeBefore);
-  DEBUG_PRINT(F("[NTP] Time after:  "));
-  DEBUG_PRINTLN(timeAfter);
-
-  if (ok) {
-    DEBUG_PRINTLN(F("[NTP] Time synchronized successfully"));
-  } else {
-    DEBUG_PRINT(F("[NTP] Failed to synchronize with "));
-    DEBUG_PRINTLN(server);
-  }
-
-  return ok;
-}
-
-bool syncTimeUTC_any(uint8_t timeZone, uint32_t waitTotalMs) {
-  const char* servers[] = {
-    "time.google.com",
-    "time.cloudflare.com",
-    "pool.ntp.org",
-  };
-  const size_t nServers = sizeof(servers) / sizeof(servers[0]);
-
-  for (size_t i = 0; i < nServers; i++) {
-    DEBUG_PRINT(F("[NTP] Trying server: "));
-    DEBUG_PRINTLN(servers[i]);
-
-    if (syncTimeUTC_viaCNTP(timeZone, servers[i], waitTotalMs)) {
-      DEBUG_PRINT(F("[NTP] Time synchronized using: "));
-      DEBUG_PRINTLN(servers[i]);
-      return true;
-    }
-  }
-
-  DEBUG_PRINTLN(F("[NTP] All NTP servers failed. Keeping previous clock / network time."));
-  return false;
-}
-
 
 bool sendATwaitOK(const char* cmd, char* out, size_t outCap, unsigned long overallMs) {
   if (outCap == 0) return false;
   out[0] = '\0';
-
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
+  if (!modem.sendCommandSync(cmd, overallMs, out, outCap)) {
+    if (DIAG) { DIAG_PRINT(F("[DIAG] sendATwaitOK result=FAIL (sync)")); DIAG_PRINTLN(strlen(out)); }
+    return false;
   }
-
-  if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendATwaitOK avail-before="));
-    DIAG_PRINTLN(sim7070.available());
-  }
-
-  sim7070.println(cmd);
   noteUartActivity();
-
-  unsigned long tstart = millis();
-  size_t w = 0;
-  bool sawOK = false, sawERROR = false;
-
-  while (millis() - tstart < overallMs) {
-    while (sim7070.available()) {
-      char c = sim7070.read();
-      noteUartActivity();
-      if (w < outCap - 1) out[w++] = c;
-
-      if (c == '\n') {
-        out[w] = '\0';
-        if (strstr(out, "\nOK") || strstr(out, "OK\r") || strstr(out, "OK\n")) {
-          sawOK = true;
-          goto done;
-        }
-        if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) {
-          sawERROR = true;
-          goto done;
-        }
-      }
-    }
-    WDT_RESET();
-  }
-
-  out[w] = '\0';
-  if (strstr(out, "OK")) sawOK = true;
-  if (strstr(out, "ERROR") || strstr(out, "+CME ERROR")) sawERROR = true;
-
-done:
-  out[w] = '\0';
+  bool sawOK = (strstr(out, "OK") != nullptr);
+  bool sawERROR = (strstr(out, "ERROR") != nullptr || strstr(out, "+CME ERROR") != nullptr);
   if (sawOK && !sawERROR) lastATokMs = millis();
   if (DIAG) {
     DIAG_PRINT(F("[DIAG] sendATwaitOK result="));
     DIAG_PRINT(sawOK && !sawERROR ? "OK" : "FAIL");
     DIAG_PRINT(F(" bytes="));
-    DIAG_PRINTLN(w);
+    DIAG_PRINTLN(strlen(out));
   }
   return sawOK && !sawERROR;
 }
@@ -1386,56 +1150,16 @@ void flushSIMBuffer() {
 void sendCommandGetResponse(const char* command, char* buffer, size_t bufferSize, unsigned long timeout) {
   if (bufferSize == 0) return;
   buffer[0] = '\0';
-  /*
-  unsigned long t0 = millis();
-  while (millis() - t0 < 20) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      noteUartActivity();
-    }
-    delay(1);
-  }
-*/
   if (DIAG) {
-    DIAG_PRINT(F("[DIAG] sendCmd avail-before="));
-    DIAG_PRINT(sim7070.available());
-    DIAG_PRINT(F(" cmd="));
+    DIAG_PRINT(F("[DIAG] sendCmd cmd="));
     DIAG_PRINTLN(command);
   }
-
-  sim7070.println(command);
+  modem.sendCommandSync(command, timeout, buffer, bufferSize);
   noteUartActivity();
-
-  unsigned long start = millis();
-  size_t idx = 0;
-  bool sawTerminator = false;
-
-  while (millis() - start < timeout && idx < bufferSize - 1) {
-    while (sim7070.available() && idx < bufferSize - 1) {
-      char c = sim7070.read();
-      noteUartActivity();
-      buffer[idx++] = c;
-
-      if (c == '\n') {
-        buffer[idx] = '\0';
-        if (strstr(buffer, "\nOK") || strstr(buffer, "OK\r") || strstr(buffer, "OK\n") || strstr(buffer, "ERROR") || strstr(buffer, "+CME ERROR")) {
-          sawTerminator = true;
-          goto endread;
-        }
-      }
-    }
-    WDT_RESET();
-  }
-
-endread:
-  buffer[idx] = '\0';
   if (strstr(buffer, "OK")) lastATokMs = millis();
-
   if (DIAG) {
     DIAG_PRINT(F("[DIAG] sendCmd done bytes="));
-    DIAG_PRINT(idx);
-    DIAG_PRINT(F(" sawTerm="));
-    DIAG_PRINTLN(sawTerminator ? "Y" : "N");
+    DIAG_PRINTLN(strlen(buffer));
   }
 }
 
@@ -1627,56 +1351,17 @@ void modemRestart() {
 
 
 
-// === Ping AT suave con drenaje y doble ventana ===
 bool modemAlivePing() {
-  unsigned long t0 = millis();
-  int drained = 0;
-  while (millis() - t0 < 30) {
-    while (sim7070.available()) {
-      (void)sim7070.read();
-      DEBUG_PRINTLN("The SIM7070G was emptied SIM7070G Modem Alive Ping");
-      noteUartActivity();
-      drained++;
-    }
-    delay(2);
+  char buf[192] = { 0 };
+  if (modem.sendCommandSync("AT", 400, buf, sizeof(buf)) && strstr(buf, "OK")) {
+    lastATokMs = millis();
+    return true;
   }
-
-  sim7070.write('\r');
-  noteUartActivity();
-  delay(40);
-
-  auto tryAT = [&](uint32_t waitMs) -> bool {
-    char buf[192] = { 0 };
-    size_t idx = 0;
-    sim7070.println("AT");
-    noteUartActivity();
-    unsigned long start = millis();
-    while (millis() - start < waitMs) {
-      while (sim7070.available()) {
-        char c = sim7070.read();
-        noteUartActivity();
-        if (idx < sizeof(buf) - 1) buf[idx++] = c;
-        if (c == '\n') {
-          buf[idx] = '\0';
-          if (strstr(buf, "\nOK") || strstr(buf, "OK\r") || strstr(buf, "OK\n") || strstr(buf, "OK")) {
-            lastATokMs = millis();
-            return true;
-          }
-        }
-      }
-      WDT_RESET();
-      delay(1);
-    }
-    buf[idx] = '\0';
-    if (strstr(buf, "OK")) {
-      lastATokMs = millis();
-      return true;
-    }
-    return false;
-  };
-
-  if (tryAT(400)) return true;
-  if (tryAT(1200)) return true;
+  buf[0] = '\0';
+  if (modem.sendCommandSync("AT", 1200, buf, sizeof(buf)) && strstr(buf, "OK")) {
+    lastATokMs = millis();
+    return true;
+  }
   return false;
 }
 
