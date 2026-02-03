@@ -147,4 +147,14 @@ bool getNetworkTimeISO8601(char* isoOut, size_t outCap);
  */
 bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap);
 
+/**
+ * Callback type: fill buffer with AT+CCLK? response, return true if "+CCLK:" present
+ */
+typedef bool (*GetCCLKResponseFn)(char* buf, size_t cap);
+
+/**
+ * Set callback used by getNetworkTimeISO8601() to obtain CCLK response (e.g. from modem)
+ */
+void setGetCCLKResponse(GetCCLKResponseFn fn);
+
 #endif // CRYPTO_JSON_UTILS_H

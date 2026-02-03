@@ -1,4 +1,4 @@
-#include "Sim7070G_AT.h"
+#include "AT_Command.h"
 #include "DEBUG.h"
 #include "Adafruit_SleepyDog.h"
 

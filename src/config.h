@@ -60,7 +60,9 @@ extern const char* CRYPTOKEY;
 #define PDP_CID 7
 // #define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
-#define PDP_APN "v-internet"
+// #define PDP_APN "v-internet"
+#define PDP_APN "m3-world"
+
 #define USERNAME_APN ""
 #define PASSWORD_APN ""
 
@@ -137,7 +139,7 @@ extern const int mqtt_port;
 
 
 // SIM7070G Configuration
-#define MODEM_BAUD_RATE 19200
+#define MODEM_BAUD_RATE 115200
 #define MODEM_POWER_PIN 12
 
 // Network configuration

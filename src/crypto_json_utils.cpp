@@ -2,6 +2,8 @@
 #include "DEBUG.h"
 #include <Sim7070G.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // External crypto key (defined in main.cpp)
 extern const char* CRYPTOKEY;
@@ -148,22 +150,21 @@ void makeNonce12(uint8_t nonce[12]) {
 
   int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0, S = 0;
   char iso[32] = { 0 };
-
-  // Try to get network time from modem (requires Sim7070G instance)
-  // For now, we'll use a fallback approach - this will be called from Sim7070GDevice
-  // which has access to the modem instance
   bool haveNetwork = false;
-  
-  // Note: This function should be called with modem instance available
-  // We'll need to pass modem instance or use a global/static reference
-  // For now, use millis() as fallback
-  uint32_t t = millis() / 1000UL;
-  H = (t / 3600UL) % 24;
-  Mi = (t / 60UL) % 60;
-  S = (t) % 60;
-  Y = 0xFFFF;
-  Mo = 0;
-  D = 0;
+  if (getNetworkTimeISO8601(iso, sizeof(iso))) {
+    if (sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
+      haveNetwork = true;
+    }
+  }
+  if (!haveNetwork) {
+    uint32_t t = millis() / 1000UL;
+    H = (t / 3600UL) % 24;
+    Mi = (t / 60UL) % 60;
+    S = (t) % 60;
+    Y = 0xFFFF;
+    Mo = 0;
+    D = 0;
+  }
 
   if ((uint16_t)Y != lastY || (uint8_t)Mo != lastM || (uint8_t)D != lastD || 
       (uint8_t)H != lastH || (uint8_t)Mi != lastMin || (uint8_t)S != lastS) {
@@ -286,22 +287,102 @@ bool decryptPayload(const uint8_t* ciphertext, size_t ctLen, const uint8_t tag[1
 }
 
 // =========================================================================
-// NETWORK TIME HELPERS (delegated to Sim7070G library)
+// NETWORK TIME HELPERS
 // =========================================================================
 
+static GetCCLKResponseFn g_getCCLKResponse = nullptr;
+
+void setGetCCLKResponse(GetCCLKResponseFn fn) {
+  g_getCCLKResponse = fn;
+}
+
 bool getNetworkTimeISO8601(char* isoOut, size_t outCap) {
-  // This function should be called with modem instance
-  // For now, return false - caller should use Sim7070G::getNetworkTimeISO8601 directly
-  (void)isoOut;
-  (void)outCap;
-  return false;
+  if (!g_getCCLKResponse || !isoOut || outCap < 21) return false;
+  char resp[96] = { 0 };
+  if (!g_getCCLKResponse(resp, sizeof(resp))) return false;
+  return parseCCLKToISO(resp, isoOut, outCap);
 }
 
 bool parseCCLKToISO(const char* cclkResp, char* isoOut, size_t outCap) {
-  // This function should be called with modem instance
-  // For now, return false - caller should use Sim7070G::parseCCLKToISO directly
-  (void)cclkResp;
-  (void)isoOut;
-  (void)outCap;
-  return false;
+  if (!cclkResp || !isoOut || outCap < 21) return false;  // "YYYY-MM-DDTHH:MM:SSZ"+NUL
+
+  const char* p = strchr(cclkResp, '\"');
+  if (!p) return false;
+  const char* q = strchr(p + 1, '\"');
+  if (!q) return false;
+
+  char core[32];
+  size_t n = (size_t)(q - (p + 1));
+  if (n >= sizeof(core)) n = sizeof(core) - 1;
+  memcpy(core, p + 1, n);
+  core[n] = '\0';
+
+  int yy = 0, MM = 0, dd = 0, hh = 0, mi = 0, ss = 0;
+  char tzStr[6] = { 0 };
+  int scanned = sscanf(core, "%2d/%2d/%2d,%2d:%2d:%2d%5s", &yy, &MM, &dd, &hh, &mi, &ss, tzStr);
+  if (scanned < 7) return false;
+
+  int y = (yy <= 69) ? (2000 + yy) : (1900 + yy);
+
+  int tzQuarter = atoi(tzStr);
+  long totalMin = (long)hh * 60L + (long)mi - (long)tzQuarter * 15L;
+
+  int dayShift = 0;
+  if (totalMin < 0) {
+    totalMin += 1440;
+    dayShift = -1;
+  } else if (totalMin >= 1440) {
+    totalMin -= 1440;
+    dayShift = 1;
+  }
+
+  int uh = (int)(totalMin / 60L);
+  int um = (int)(totalMin % 60L);
+  int us = ss;
+
+  auto isLeap = [](int Y) -> bool {
+    return ((Y % 4 == 0) && (Y % 100 != 0)) || (Y % 400 == 0);
+  };
+  auto dim = [&](int Y, int M) -> int {
+    switch (M) {
+      case 1: return 31;
+      case 2: return isLeap(Y) ? 29 : 28;
+      case 3: return 31;
+      case 4: return 30;
+      case 5: return 31;
+      case 6: return 30;
+      case 7: return 31;
+      case 8: return 31;
+      case 9: return 30;
+      case 10: return 31;
+      case 11: return 30;
+      case 12: return 31;
+      default: return 30;
+    }
+  };
+
+  if (dayShift == -1) {
+    dd -= 1;
+    if (dd <= 0) {
+      MM -= 1;
+      if (MM <= 0) {
+        MM = 12;
+        y -= 1;
+      }
+      dd = dim(y, MM);
+    }
+  } else if (dayShift == 1) {
+    dd += 1;
+    if (dd > dim(y, MM)) {
+      dd = 1;
+      MM += 1;
+      if (MM > 12) {
+        MM = 1;
+        y += 1;
+      }
+    }
+  }
+
+  snprintf(isoOut, outCap, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, MM, dd, uh, um, us);
+  return true;
 }

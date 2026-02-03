@@ -2,7 +2,7 @@
 #define SIM7070G_H
 
 #include <Arduino.h>
-#include "Sim7070G_AT.h"
+#include "AT_Command.h"
 #include "config.h"
 
 // Network states
