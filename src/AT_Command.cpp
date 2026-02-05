@@ -372,8 +372,10 @@ void Sim7070G_AT::completeCommand(ATResponseType type, const char* response) {
   if (cmd->callback) {
     cmd->callback(type, response, cmd->userData);
   }
-  
-  _currentCommand = nullptr;
+  /* If callback sent next command (e.g. connSendNext), _currentCommand is already set; do not clear. */
+  if (_currentCommand == cmd) {
+    _currentCommand = nullptr;
+  }
 }
 
 void Sim7070G_AT::setError(const char* error) {

@@ -38,8 +38,8 @@ extern const char* CRYPTOKEY;
 #define MAX_HISTORY_SIZE 60
 #define WATER_METER_READ_INTERVAL_MS 15000
 
-#define PDP_CID 7
-// #define PDP_CID 1
+// #define PDP_CID 7
+#define PDP_CID 1
 // #define PDP_APN "iot.1nce.net"
 // #define PDP_APN "v-internet"
 #define PDP_APN "m3-world"
@@ -69,6 +69,7 @@ extern const int mqtt_port;
 #define BOOT_WAIT_MS 6000UL
 
 #define RECONN_INTERVAL_MS 10000UL
+#define RECONNECT_DEBOUNCE_MS 5000UL
 
 #define MIN_RESTART_GAP_MS 15000UL
 

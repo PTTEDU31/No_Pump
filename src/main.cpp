@@ -75,6 +75,7 @@ unsigned long publishIntervalMs = PUB_FAST_MS;
 
 // CHECK CONNECTIONS INTERVAL from config.h (CHECK_INTERVAL_MS)
 unsigned long lastCheck = 0;
+static unsigned long lastReconnectTrigger = 0;
 
 // ----------------- CONNECTION STATE MACHINE (async) -----------------
 enum ConnState {
@@ -99,6 +100,8 @@ static uint8_t connSubStep = 0;       // retry/attempt counter within a state
 static unsigned long connStateStartMs = 0;
 static char connResponseBuf[320];     // for async AT response
 static bool connWaitingAT = false;    // avoid spamming AT in RESTART_WAIT
+/** CID to use for CNACT=,0/1; parsed from AT+CNACT? response (first context found), else PDP_CID. */
+static uint8_t connActivateCid = PDP_CID;
 
 byte pump = 0;
 int onPulse = ON_PULSE_MS;
@@ -197,12 +200,15 @@ void modemRestart();
 void mqttConnect();
 bool checkMQTTConnection();
 static void mainMQTTStateCallback(MQTTState state);
+static void mainNetworkStateCallback(Sim7070GState state);
 bool publishMessage();
 bool gprsConnect();
 bool gprsIsConnected();
 void handleMQTTMessages();
 void flushSIMBuffer();
 void checkConnections();
+/** Schedule next checkConnections() to run state machine immediately (auto-reconnect). Debounced by RECONNECT_DEBOUNCE_MS. */
+static void scheduleReconnectCheck();
 static void connOnATResult(ATResponseType type, const char* response, void* userData);
 static void connOnCNACTDisconnectResult(ATResponseType type, const char* response, void* userData);
 static void connOnCNACTQueryResult(ATResponseType type, const char* response, void* userData);
@@ -287,6 +293,7 @@ void setup() {
   }
   modem.setMQTTMessageCallback(mainMQTTMessageCallback);
   modem.setMQTTStateCallback(mainMQTTStateCallback);
+  modem.setNetworkStateCallback(mainNetworkStateCallback);
   modem.setCNTPResultCallback(mainCNTPResultCallback);
 
   tempSAMD.init();
@@ -383,7 +390,21 @@ static void mainMQTTStateCallback(MQTTState state) {
     if (modem.mqttSubscribe(topic_sub, 0)) {
       DEBUG_PRINT(F("[MQTT] Subscribed to: "));
       DEBUG_PRINTLN(topic_sub);
+      mqttConnected = true;
     }
+  } else if (state == MQTTState::DISCONNECTED || state == MQTTState::ERROR) {
+    mqttConnected = false;
+    DEBUG_PRINTLN(F("[MQTT] state DISCONNECTED/ERROR -> mqttConnected=false, scheduling auto reconnect"));
+    scheduleReconnectCheck();
+  }
+  /* DISCONNECTING: do not treat as "lost connection" - often we called mqttDisconnect() ourselves before SMCONN in the reconnect flow */
+}
+
+static void mainNetworkStateCallback(Sim7070GState state) {
+  if (state == Sim7070GState::NETWORK_DISCONNECTED) {
+    mqttConnected = false;
+    DEBUG_PRINTLN(F("[NET] state NETWORK_DISCONNECTED -> mqttConnected=false, schedule reconnect"));
+    scheduleReconnectCheck();
   }
 }
 
@@ -605,13 +626,34 @@ static void connOnCNACTDisconnectResult(ATResponseType type, const char* respons
   if (type == ATResponseType::OK) {
     connTransition(CONN_GPRS_ACTIVATE, 1);
   } else {
-    connTransition(CONN_GPRS_FALLBACK, 0);
+    /* ERROR from CNACT=,0 often means context already deactivated; proceed to activate (CNACT=,1) */
+    DEBUG_PRINTLN(F("[CONN] CNACT=,0 returned ERROR (likely already deactivated), trying activate"));
+    connTransition(CONN_GPRS_ACTIVATE, 1);
   }
   connSendNext();
 }
 
 static void connOnCNACTQueryResult(ATResponseType type, const char* response, void* userData) {
   (void)userData;
+  if (response && strstr(response, "+CNACT:")) {
+    uint8_t firstCid = 255;
+    bool foundPDP = false;
+    for (const char* p = response; (p = strstr(p, "+CNACT:")) != nullptr; p++) {
+      unsigned int cid = 0;
+      if (sscanf(p, "+CNACT: %u,", &cid) == 1 && cid <= 16) {
+        if (firstCid == 255) firstCid = (uint8_t)cid;
+        if (cid == (unsigned int)PDP_CID) {
+          connActivateCid = (uint8_t)cid;
+          foundPDP = true;
+          break;
+        }
+      }
+    }
+    if (!foundPDP && firstCid != 255)
+      connActivateCid = firstCid;
+    DEBUG_PRINT(F("[CONN] CNACT CID: "));
+    DEBUG_PRINTLN(connActivateCid);
+  }
   if (type == ATResponseType::OK && response && strstr(response, "+CNACT:") && strstr(response, ",1,")) {
     gprsFailStreak = 0;
     lastGPRSokMs = millis();
@@ -667,7 +709,7 @@ static void connOnSMCONNResult(ATResponseType type, const char* response, void* 
   (void)userData;
   if (type == ATResponseType::OK) {
     cntMqttConnects++;
-    mqttConnected = true;
+    // mqttConnected = true;
     mqttFailStreak = 0;
     lastMQTTokMs = millis();
     connTransition(CONN_DONE, 0);
@@ -729,11 +771,12 @@ static void connSendNext() {
       break;
     case CONN_GPRS_ACTIVATE: {
       char cmd[24];
+      uint8_t cid = connActivateCid;
       if (connSubStep == 0) {
-        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,0", PDP_CID);
+        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,0", (int)cid);
         modem.sendCommand(cmd, 800, connOnCNACTDisconnectResult, nullptr);
       } else {
-        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,1", PDP_CID);
+        snprintf(cmd, sizeof(cmd), "AT+CNACT=%d,1", (int)cid);
         modem.sendCommand(cmd, 10000, connOnCNACTActivateResult, nullptr);
       }
       break;
@@ -793,6 +836,15 @@ static void connSendNext() {
       connState = CONN_IDLE;
       break;
   }
+}
+
+static void scheduleReconnectCheck() {
+  if (connState != CONN_IDLE) return;
+  unsigned long now = millis();
+  if ((long)(now - lastReconnectTrigger) < (long)RECONNECT_DEBOUNCE_MS) return;
+  lastReconnectTrigger = now;
+  lastCheck = 0;
+  DEBUG_PRINTLN(F("[RECONN] scheduled immediate reconnect check"));
 }
 
 void checkConnections() {
@@ -939,14 +991,43 @@ bool publishMessage() {
       DEBUG_PRINT(' ');
     }
     DEBUG_PRINTLN();
+    mqttConnected = false;
+    scheduleReconnectCheck();
     return false;
   }
+  modem.expectPublishResponse();
   noteUartActivity();
   sim7070.print(hexPayload);
   noteUartActivity();
-  delay(350);
-  noteUartActivity();
 
+  const unsigned long publishRespTimeoutMs = 60000UL;
+  const unsigned long startWait = millis();
+  bool gotResponse = false;
+  bool publishOk = false;
+  while ((millis() - startWait) < publishRespTimeoutMs) {
+    modem.loop();
+    if (modem.consumePublishResponse(&publishOk)) {
+      gotResponse = true;
+      break;
+    }
+    delay(20);
+    WDT_RESET();
+  }
+  if (!gotResponse) {
+    DEBUG_PRINTLN(F("[SMPUB] timeout waiting for OK/ERROR after payload"));
+    mqttConnected = false;
+    scheduleReconnectCheck();
+    EventCountTotal = 0;
+    return false;
+  }
+  if (!publishOk) {
+    DEBUG_PRINTLN(F("[SMPUB] modem returned ERROR after payload"));
+    mqttConnected = false;
+    scheduleReconnectCheck();
+    EventCountTotal = 0;
+    return false;
+  }
+  noteUartActivity();
   EventCountTotal = 0;
   return true;
 }

@@ -113,6 +113,8 @@ public:
   bool mqttDisconnect();
   bool mqttPublish(const char* topic, const char* payload, uint8_t qos = 0, bool retain = false);
   bool mqttPublishHex(const char* topic, const uint8_t* payload, size_t len, uint8_t qos = 0, bool retain = false);
+  /** Tell modem to capture next OK/ERROR as publish response (call before sending payload after ">"). */
+  void expectPublishResponse();
   /** Consume publish response (OK/ERROR received after payload). Returns true if response was received; outOk = true for OK, false for ERROR. */
   bool consumePublishResponse(bool* outOk = nullptr);
   bool mqttSubscribe(const char* topic, uint8_t qos = 0);

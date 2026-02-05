@@ -1391,6 +1391,13 @@ void Sim7070G::onUnsolicitedResponse(ATResponseType type, const char *response, 
   DEBUG_PRINTLN();
 }
 
+void Sim7070G::expectPublishResponse()
+{
+  _waitingPublishResponse = true;
+  _publishResponseReceived = false;
+  _publishResponseOk = false;
+}
+
 bool Sim7070G::consumePublishResponse(bool *outOk)
 {
   if (!_publishResponseReceived)
